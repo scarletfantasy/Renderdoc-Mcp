@@ -47,13 +47,27 @@ def test_session_pool_opens_and_reuses_capture_ids(tmp_path: Path) -> None:
     assert pool.get(session.capture_id) is not None
 
 
-def test_session_pool_creates_distinct_sessions_for_distinct_opens(tmp_path: Path) -> None:
+def test_session_pool_reuses_existing_session_for_same_capture_path(tmp_path: Path) -> None:
     capture_path = _capture(tmp_path, "sample.rdc")
     created: list[FakeBridge] = []
     pool = CaptureSessionPool(bridge_factory=lambda: created.append(FakeBridge()) or created[-1])
 
     first = pool.open(capture_path)
     second = pool.open(capture_path)
+
+    assert first.capture_id == second.capture_id
+    assert pool.session_count() == 1
+    assert len(created) == 1
+
+
+def test_session_pool_creates_distinct_sessions_for_distinct_capture_paths(tmp_path: Path) -> None:
+    first_capture = _capture(tmp_path, "first.rdc")
+    second_capture = _capture(tmp_path, "second.rdc")
+    created: list[FakeBridge] = []
+    pool = CaptureSessionPool(bridge_factory=lambda: created.append(FakeBridge()) or created[-1])
+
+    first = pool.open(first_capture)
+    second = pool.open(second_capture)
 
     assert first.capture_id != second.capture_id
     assert pool.session_count() == 2

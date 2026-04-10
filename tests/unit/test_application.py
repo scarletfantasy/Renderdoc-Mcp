@@ -444,6 +444,20 @@ def test_open_capture_returns_capture_id_and_overview(tmp_path: Path) -> None:
     assert created[0].calls == [("get_capture_overview", {})]
 
 
+def test_open_capture_reuses_existing_session_for_same_capture_path(tmp_path: Path) -> None:
+    application, created = _application()
+    capture_path = _capture(tmp_path)
+
+    first = application.captures.renderdoc_open_capture(capture_path)
+    second = application.captures.renderdoc_open_capture(capture_path)
+
+    assert first["capture_id"] == second["capture_id"]
+    assert first["capture_path"] == second["capture_path"]
+    assert len(created) == 1
+    assert created[0].loaded == [capture_path, capture_path]
+    assert created[0].calls == [("get_capture_overview", {}), ("get_capture_overview", {})]
+
+
 def test_handlers_reuse_capture_id_session_and_attach_meta(tmp_path: Path) -> None:
     application, created = _application()
     capture_path = _capture(tmp_path)

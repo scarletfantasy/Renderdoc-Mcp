@@ -57,13 +57,17 @@ class CaptureSessionPool:
         now = self._monotonic()
         with self._lock:
             expired = self._pop_expired_locked(now)
-            session = CaptureSession(
-                capture_id=create_capture_id(),
-                capture_path=capture_path,
-                bridge=self._bridge_factory(),
-                last_used_monotonic=now,
-            )
-            self._sessions[session.capture_id] = session
+            session = next((item for item in self._sessions.values() if item.capture_path == capture_path), None)
+            if session is None:
+                session = CaptureSession(
+                    capture_id=create_capture_id(),
+                    capture_path=capture_path,
+                    bridge=self._bridge_factory(),
+                    last_used_monotonic=now,
+                )
+                self._sessions[session.capture_id] = session
+            else:
+                session.last_used_monotonic = now
         self._close_sessions(expired)
         return session
 

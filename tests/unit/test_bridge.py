@@ -47,6 +47,7 @@ class FakeContext:
     def __init__(self, controller) -> None:
         self.controller = controller
         self.loaded = True
+        self.set_event_calls: list[tuple[object, ...]] = []
 
     def Extensions(self):
         return FakeExtensions()
@@ -61,7 +62,11 @@ class FakeContext:
         return FakeAction()
 
     def SetEventID(self, *args):
+        self.set_event_calls.append(args)
         return None
+
+    def CurEvent(self):
+        return self.controller.current_event
 
     def GetResourceName(self, resource_id):
         return str(resource_id)
@@ -114,6 +119,8 @@ class FakeController:
         self.api_name = api_name
         self.state = state or FakeState()
         self.shader_debugging = shader_debugging
+        self.current_event = 7
+        self.set_frame_event_calls: list[tuple[int, bool]] = []
         self.debug_pixel_calls: list[tuple[int, int, object]] = []
         self.continue_debug_batches: list[list[object]] = []
         self.freed_traces: list[object] = []
@@ -126,6 +133,10 @@ class FakeController:
 
     def GetPipelineState(self):
         return self.state
+
+    def SetFrameEvent(self, event_id, force=False):
+        self.current_event = int(event_id)
+        self.set_frame_event_calls.append((int(event_id), bool(force)))
 
     def DebugPixel(self, x, y, inputs):
         self.debug_pixel_calls.append((x, y, inputs))
@@ -429,11 +440,12 @@ def test_bridge_client_pixel_modification_preserves_unknown_pixel_value_payloads
 
 def test_bridge_client_get_texture_data_serializes_wrapped_pick_pixel_values(monkeypatch) -> None:
     controller = FakeController()
-    client = BridgeClient(FakeContext(controller))
+    context = FakeContext(controller)
+    client = BridgeClient(context)
     texture = SimpleNamespace(resourceId="tex-1")
 
     monkeypatch.setattr(client, "_ensure_capture_loaded", lambda: None)
-    monkeypatch.setattr(client, "_ensure_final_event", lambda: None)
+    monkeypatch.setattr(client, "_final_event_id", lambda: 99)
     monkeypatch.setattr(client, "_find_texture_by_id", lambda texture_id: texture)
     monkeypatch.setattr(
         client,
@@ -451,27 +463,34 @@ def test_bridge_client_get_texture_data_serializes_wrapped_pick_pixel_values(mon
         "_serialize_texture",
         lambda ctx, texture: {"resource_id": str(texture.resourceId)},
     )
+
+    def pick_pixel(resource_id, x, y, subresource, comp_type):
+        assert controller.current_event == 99
+        return SimpleNamespace(floatValue=SimpleNamespace(r=1.0, g=0.5, b=0.25, a=1.0))
+
     monkeypatch.setattr(
         controller,
         "PickPixel",
-        lambda resource_id, x, y, subresource, comp_type: SimpleNamespace(
-            floatValue=SimpleNamespace(r=1.0, g=0.5, b=0.25, a=1.0)
-        ),
+        pick_pixel,
         raising=False,
     )
 
     response = client._get_texture_data("tex-1", 0, 2, 3, 1, 1, 0, 0)
 
     assert response["pixels"] == [[[1.0, 0.5, 0.25, 1.0]]]
+    assert context.set_event_calls == []
+    assert controller.current_event == 7
+    assert controller.set_frame_event_calls == [(99, False), (7, False)]
 
 
 def test_bridge_client_probe_texture_pixel_grid_serializes_rgba_pick_pixel_values(monkeypatch) -> None:
     controller = FakeController()
-    client = BridgeClient(FakeContext(controller))
+    context = FakeContext(controller)
+    client = BridgeClient(context)
     texture = SimpleNamespace(resourceId="tex-1")
 
     monkeypatch.setattr(client, "_ensure_capture_loaded", lambda: None)
-    monkeypatch.setattr(client, "_ensure_final_event", lambda: None)
+    monkeypatch.setattr(client, "_final_event_id", lambda: 99)
     monkeypatch.setattr(client, "_find_texture_by_id", lambda texture_id: texture)
     monkeypatch.setattr(
         client,
@@ -490,16 +509,66 @@ def test_bridge_client_probe_texture_pixel_grid_serializes_rgba_pick_pixel_value
         "_serialize_texture",
         lambda ctx, texture: {"resource_id": str(texture.resourceId)},
     )
+
+    def pick_pixel(resource_id, x, y, subresource, comp_type):
+        assert controller.current_event == 99
+        return SimpleNamespace(r=0.1, g=0.2, b=0.3, a=0.4)
+
     monkeypatch.setattr(
         controller,
         "PickPixel",
-        lambda resource_id, x, y, subresource, comp_type: SimpleNamespace(r=0.1, g=0.2, b=0.3, a=0.4),
+        pick_pixel,
         raising=False,
     )
 
     response = client._probe_texture_pixel_grid("tex-1", 0, 0, 0, 5, 6, 1, 1)
 
     assert response["pixels"] == [[[0.1, 0.2, 0.3, 0.4]]]
+    assert context.set_event_calls == []
+    assert controller.current_event == 7
+    assert controller.set_frame_event_calls == [(99, False), (7, False)]
+
+
+def test_bridge_client_pixel_history_payload_uses_temporary_final_event(monkeypatch) -> None:
+    controller = FakeController()
+    context = FakeContext(controller)
+    client = BridgeClient(context)
+    texture = SimpleNamespace(resourceId="tex-1")
+
+    monkeypatch.setattr(client, "_final_event_id", lambda: 99)
+    monkeypatch.setattr(client, "_find_texture_by_id", lambda texture_id: texture)
+    monkeypatch.setattr(
+        client,
+        "_validate_texture_request",
+        lambda texture, mip_level, array_slice, sample, x=None, y=None, width=None, height=None: {
+            "mip_width": 16,
+            "mip_height": 16,
+            "mip_depth": 1,
+        },
+    )
+    monkeypatch.setattr(client, "_default_comp_type", lambda texture: 0)
+    monkeypatch.setattr(client, "_serialize_pixel_modification", lambda item, structured_file: {"event_id": int(item.eventId)})
+    monkeypatch.setattr(bridge_client_module, "_subresource", lambda mip_level, array_slice, sample: object())
+    monkeypatch.setattr(
+        bridge_client_module,
+        "_serialize_texture",
+        lambda ctx, texture: {"resource_id": str(texture.resourceId)},
+    )
+    monkeypatch.setattr(controller, "GetUsage", lambda resource_id: [11], raising=False)
+
+    def pixel_history(*args):
+        assert controller.current_event == 99
+        return [SimpleNamespace(eventId=11)]
+
+    monkeypatch.setattr(controller, "PixelHistory", pixel_history, raising=False)
+
+    response = client._pixel_history_payload("tex-1", 2, 3, 0, 0, 0)
+
+    assert response["modifications"] == [{"event_id": 11}]
+    assert response["modification_count"] == 1
+    assert context.set_event_calls == []
+    assert controller.current_event == 7
+    assert controller.set_frame_event_calls == [(99, False), (7, False)]
 
 
 def test_bridge_client_shader_summary_returns_unavailable_when_disassembly_targets_missing(monkeypatch) -> None:
@@ -872,12 +941,13 @@ def test_bridge_client_pixel_shader_debug_converts_no_preference_to_uint32(monke
 
 def test_bridge_client_get_buffer_data_uses_checked_block_invoke(monkeypatch) -> None:
     controller = FakeController()
-    client = BridgeClient(FakeContext(controller))
+    context = FakeContext(controller)
+    client = BridgeClient(context)
     buffer_desc = SimpleNamespace(resourceId="buf-1", length=4)
     used_checked_invoke = {"used": False}
 
     monkeypatch.setattr(client, "_ensure_capture_loaded", lambda: None)
-    monkeypatch.setattr(client, "_ensure_final_event", lambda: None)
+    monkeypatch.setattr(client, "_final_event_id", lambda: 99)
     monkeypatch.setattr(client, "_find_buffer_by_id", lambda buffer_id: buffer_desc)
     monkeypatch.setattr(
         client,
@@ -890,10 +960,14 @@ def test_bridge_client_get_buffer_data_uses_checked_block_invoke(monkeypatch) ->
             "usage_flags": "NoFlags",
         },
     )
+    def get_buffer_data(resource_id, offset, size):
+        assert controller.current_event == 99
+        return b"\x00\x01\x7f\xff"
+
     monkeypatch.setattr(
         controller,
         "GetBufferData",
-        lambda resource_id, offset, size: b"\x00\x01\x7f\xff",
+        get_buffer_data,
         raising=False,
     )
 
@@ -907,6 +981,60 @@ def test_bridge_client_get_buffer_data_uses_checked_block_invoke(monkeypatch) ->
 
     assert used_checked_invoke["used"] is True
     assert payload["data"] == "00 01 7f ff"
+    assert context.set_event_calls == []
+    assert controller.current_event == 7
+    assert controller.set_frame_event_calls == [(99, False), (7, False)]
+
+
+def test_bridge_client_save_texture_to_file_uses_temporary_final_event(monkeypatch, tmp_path) -> None:
+    controller = FakeController()
+    context = FakeContext(controller)
+    client = BridgeClient(context)
+    texture = SimpleNamespace(resourceId="tex-1")
+    output_path = tmp_path / "texture.png"
+
+    class FakeTextureSave:
+        def __init__(self) -> None:
+            self.resourceId = None
+            self.mip = 0
+            self.slice = SimpleNamespace(sliceIndex=0)
+            self.destType = None
+
+    monkeypatch.setattr(client, "_final_event_id", lambda: 99)
+    monkeypatch.setattr(client, "_find_texture_by_id", lambda texture_id: texture)
+    monkeypatch.setattr(client, "_validate_texture_request", lambda texture, mip_level, array_slice, sample: None)
+    monkeypatch.setattr(
+        bridge_client_module,
+        "_serialize_texture",
+        lambda ctx, texture: {"resource_id": str(texture.resourceId)},
+    )
+    monkeypatch.setattr(
+        bridge_client_module,
+        "rd",
+        SimpleNamespace(
+            TextureSave=FakeTextureSave,
+            FileType=SimpleNamespace(PNG="PNG"),
+        ),
+    )
+
+    def save_texture(texsave, path):
+        assert controller.current_event == 99
+        assert texsave.resourceId == "tex-1"
+        assert texsave.mip == 0
+        assert texsave.slice.sliceIndex == 0
+        assert texsave.destType == "PNG"
+        Path(path).write_bytes(b"png")
+
+    monkeypatch.setattr(controller, "SaveTexture", save_texture, raising=False)
+
+    payload = client._save_texture_to_file("tex-1", str(output_path), 0, 0)
+
+    assert payload["saved"] is True
+    assert payload["file_type"] == "PNG"
+    assert payload["file_size"] == 3
+    assert context.set_event_calls == []
+    assert controller.current_event == 7
+    assert controller.set_frame_event_calls == [(99, False), (7, False)]
 
 
 def test_bridge_client_shader_debug_step_requires_cached_history(monkeypatch) -> None:

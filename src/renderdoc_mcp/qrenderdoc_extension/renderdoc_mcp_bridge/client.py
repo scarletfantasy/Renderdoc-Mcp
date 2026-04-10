@@ -861,12 +861,50 @@ class BridgeClient(object):
             maximum = max(maximum, int(node.get("event_id", 0)), self._analysis_max_event_id(node.get("children", [])))
         return maximum
 
-    def _ensure_final_event(self):
+    def _final_event_id(self):
+        self._ensure_capture_loaded()
+        get_last_action = getattr(self.ctx, "GetLastAction", None)
+        if callable(get_last_action):
+            action = get_last_action()
+            event_id = int(getattr(action, "eventId", 0) or 0)
+            if event_id > 0:
+                return event_id
+
         analysis = self._ensure_frame_analysis()
-        event_id = self._analysis_max_event_id(analysis.get("action_tree", []))
+        return self._analysis_max_event_id(analysis.get("action_tree", []))
+
+    def _ensure_final_event(self):
+        event_id = self._final_event_id()
         if event_id > 0:
             self._set_event(event_id)
-        return analysis
+        return self._ensure_frame_analysis()
+
+    def _invoke_with_temporary_event(self, event_id, callback):
+        current_event_getter = getattr(self.ctx, "CurEvent", None)
+        current_event_id = int(current_event_getter()) if callable(current_event_getter) else None
+        target_event_id = int(event_id) if event_id is not None else None
+
+        def runner(controller):
+            switched = False
+            try:
+                if target_event_id is not None and current_event_id != target_event_id:
+                    try:
+                        controller.SetFrameEvent(target_event_id, False)
+                    except TypeError:
+                        controller.SetFrameEvent(target_event_id)
+                    switched = True
+                callback(controller)
+            finally:
+                if switched and current_event_id is not None:
+                    try:
+                        controller.SetFrameEvent(current_event_id, False)
+                    except TypeError:
+                        controller.SetFrameEvent(current_event_id)
+
+        self._block_invoke_checked(runner)
+
+    def _invoke_at_final_event(self, callback):
+        self._invoke_with_temporary_event(self._final_event_id(), callback)
 
     def _find_texture_by_id(self, texture_id):
         for texture in self.ctx.GetTextures():
@@ -1222,7 +1260,6 @@ class BridgeClient(object):
 
     def _pixel_history_payload(self, texture_id, x, y, mip_level, array_slice, sample):
         self._ensure_capture_loaded()
-        self._ensure_final_event()
         response = {
             "query": {
                 "texture_id": texture_id,
@@ -1255,7 +1292,7 @@ class BridgeClient(object):
             response["modifications"] = [self._serialize_pixel_modification(item, structured_file) for item in modifications]
             response["modification_count"] = len(response["modifications"])
 
-        self.ctx.Replay().BlockInvoke(callback)
+        self._invoke_at_final_event(callback)
         return response
 
     def _load_capture(self, capture_path):
@@ -2757,7 +2794,6 @@ class BridgeClient(object):
 
     def _probe_texture_pixel_grid(self, texture_id, mip_level, array_slice, sample, x, y, width, height):
         self._ensure_capture_loaded()
-        self._ensure_final_event()
         response = {
             "query": {
                 "texture_id": str(texture_id),
@@ -2816,7 +2852,7 @@ class BridgeClient(object):
             }
             response["pixels"] = pixels
 
-        self._block_invoke_checked(callback)
+        self._invoke_at_final_event(callback)
         return response
 
     def _probe_texture_regions(
@@ -3002,7 +3038,6 @@ class BridgeClient(object):
 
     def _get_texture_data(self, texture_id, mip_level, x, y, width, height, array_slice, sample):
         self._ensure_capture_loaded()
-        self._ensure_final_event()
         response = {
             "query": {
                 "texture_id": texture_id,
@@ -3038,12 +3073,11 @@ class BridgeClient(object):
             response["column_count"] = len(pixels[0]) if pixels else 0
             response["pixels"] = pixels
 
-        self.ctx.Replay().BlockInvoke(callback)
+        self._invoke_at_final_event(callback)
         return response
 
     def _get_buffer_data(self, buffer_id, offset, size, encoding):
         self._ensure_capture_loaded()
-        self._ensure_final_event()
         response = {
             "buffer_id": buffer_id,
             "offset": int(offset),
@@ -3074,12 +3108,11 @@ class BridgeClient(object):
             else:
                 response["data"] = _hex_bytes_with_spaces(data)
 
-        self._block_invoke_checked(callback)
+        self._invoke_at_final_event(callback)
         return response
 
     def _save_texture_to_file(self, texture_id, output_path, mip_level, array_slice):
         self._ensure_capture_loaded()
-        self._ensure_final_event()
         response = {
             "texture_id": texture_id,
             "output_path": os.path.abspath(output_path),
@@ -3136,7 +3169,7 @@ class BridgeClient(object):
             response["file_type"] = file_type_name
             response["file_size"] = int(os.path.getsize(os.path.abspath(output_path)))
 
-        self.ctx.Replay().BlockInvoke(callback)
+        self._invoke_at_final_event(callback)
         return response
 
     def _list_resources(self, kind, cursor, limit, name_filter, sort_by):

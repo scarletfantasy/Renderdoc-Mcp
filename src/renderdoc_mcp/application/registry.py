@@ -79,7 +79,8 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
     ),
     ToolSpec(
         "renderdoc_get_pipeline_overview",
-        "Return a compact pipeline overview with counts and shader stage summaries for an event.",
+        "Return a compact pipeline overview with counts and shader stage summaries for an event. "
+        "When using the qrenderdoc backend, this also selects the supplied event_id (EID) in the UI.",
         "get_pipeline_overview",
         lambda application: application.actions.renderdoc_get_pipeline_overview,
     ),
