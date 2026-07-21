@@ -1,6 +1,7 @@
 from .action_listing import (
     build_action_children_result,
     build_action_list_result,
+    build_action_search_result,
     build_action_summary_result,
     build_action_tree_result,
 )
@@ -48,6 +49,7 @@ __all__ = [
     "action_summary",
     "build_action_children_result",
     "build_action_list_result",
+    "build_action_search_result",
     "build_action_summary_result",
     "build_action_tree_result",
     "build_analysis_result",

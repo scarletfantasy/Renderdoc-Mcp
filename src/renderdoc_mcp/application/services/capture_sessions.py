@@ -29,6 +29,14 @@ class CaptureSessionService:
         with self._session_pool.open_lease(capture_path) as session:
             yield session
 
+    @contextmanager
+    def open_normalized_capture_lease_with_status(
+        self,
+        capture_path: str,
+    ) -> Iterator[tuple[CaptureSession, bool]]:
+        with self._session_pool.open_lease_with_status(capture_path) as lease:
+            yield lease
+
     def close_capture(self, capture_id: str) -> bool:
         normalized_id = self._normalizer.normalize_required_capture_id(capture_id)
         return self.close_normalized_capture(normalized_id)
@@ -43,8 +51,14 @@ class CaptureSessionService:
     def get_normalized_session(self, capture_id: str) -> CaptureSession:
         session = self._session_pool.get(capture_id)
         if session is None:
-            raise InvalidCaptureIDError(capture_id)
+            raise InvalidCaptureIDError(
+                capture_id,
+                available_capture_ids=[str(item["capture_id"]) for item in self._session_pool.list_sessions()],
+            )
         return session
+
+    def list_sessions(self) -> list[dict[str, object]]:
+        return self._session_pool.list_sessions()
 
     def capture_tool(
         self,
@@ -66,4 +80,7 @@ class CaptureSessionService:
                 session.bridge.ensure_capture_loaded(session.capture_path)
                 return session, session.bridge.call(method, params or {})
         except KeyError as exc:
-            raise InvalidCaptureIDError(capture_id) from exc
+            raise InvalidCaptureIDError(
+                capture_id,
+                available_capture_ids=[str(item["capture_id"]) for item in self._session_pool.list_sessions()],
+            ) from exc

@@ -12,13 +12,13 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 import anyio
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
-WORKFLOW_VERSION = "ai_surface_v1"
+WORKFLOW_VERSION = "ai_surface_v2"
 TOKEN_BUDGET = 25_000
 LATENCY_BUDGET_MS = 5_000.0
 PAYLOAD_WEIGHT = 0.85
@@ -28,32 +28,63 @@ DEFAULT_HISTORY_PATH = Path("benchmarks") / "ai_surface_history.jsonl"
 INTERACTIVE_LABELS = {
     "capture_overview",
     "analysis_worklist",
+    "correctness_worklist",
     "list_passes",
     "pass_summary",
     "timing_events",
-    "list_actions",
-    "action_summary",
-    "pipeline_overview",
-    "pipeline_bindings",
+    "search_actions",
+    "event_dossier",
     "shader_summary",
-    "shader_code_chunk",
+    "shader_search",
     "list_resources",
     "resource_summary",
+    "resource_binding_search",
+    "create_investigation",
+    "set_investigation_focus",
+    "restore_investigation",
+    "compare_events",
+    "close_investigation",
 }
 STAGE_GROUPS = {
     "overview": {"capture_overview", "analysis_worklist"},
     "pass_drilldown": {"list_passes", "pass_summary", "timing_events"},
     "event_drilldown": {
-        "list_actions",
-        "action_summary",
-        "pipeline_overview",
-        "pipeline_bindings",
+        "search_actions",
+        "event_dossier",
         "shader_summary",
-        "shader_code_chunk",
+        "shader_search",
     },
-    "resource_drilldown": {"list_resources", "resource_summary"},
+    "resource_drilldown": {"list_resources", "resource_summary", "resource_binding_search"},
+    "correctness": {"correctness_worklist", "search_actions", "event_dossier"},
+    "continuation": {"create_investigation", "set_investigation_focus", "restore_investigation"},
+    "regression": {"compare_events"},
     "interactive": INTERACTIVE_LABELS,
 }
+
+
+class HistoryDerivedScenario(TypedDict):
+    labels: set[str]
+    max_calls: int
+
+
+HISTORY_DERIVED_SCENARIOS: dict[str, HistoryDerivedScenario] = {
+    "nested_action_discovery": {"labels": {"search_actions"}, "max_calls": 1},
+    "correctness_event_dossier": {"labels": {"correctness_worklist", "event_dossier"}, "max_calls": 2},
+    "resource_attribution": {
+        "labels": {"list_resources", "resource_summary", "resource_binding_search"},
+        "max_calls": 3,
+    },
+    "shader_root_cause": {"labels": {"shader_summary", "shader_search"}, "max_calls": 2},
+    "continuation_reuse": {
+        "labels": {"create_investigation", "set_investigation_focus", "restore_investigation"},
+        "max_calls": 3,
+    },
+    "event_regression": {"labels": {"compare_events"}, "max_calls": 1},
+}
+
+
+MAX_TURN_PAYLOAD_BYTES = 256 * 1024
+MAX_CORRECTNESS_CALLS = 20
 LEGACY_INTERACTIVE_LABELS = {
     "capture_summary",
     "analyze_frame",
@@ -140,6 +171,28 @@ def summarize_metrics(metrics: list[CallMetric], labels: set[str]) -> dict[str, 
         "total_elapsed_ms": total_elapsed_ms,
         "largest_call": _largest_call(selected),
     }
+
+
+def summarize_history_scenarios(metrics: list[CallMetric]) -> dict[str, Any]:
+    scenarios: dict[str, Any] = {}
+    for name, spec in HISTORY_DERIVED_SCENARIOS.items():
+        summary = summarize_metrics(metrics, set(spec["labels"]))
+        summary["max_calls"] = int(spec["max_calls"])
+        summary["within_call_budget"] = summary["call_count"] <= summary["max_calls"]
+        scenarios[name] = summary
+    return scenarios
+
+
+def build_acceptance(metrics: list[CallMetric], stages: dict[str, Any]) -> dict[str, Any]:
+    interactive = stages["interactive"]
+    largest = interactive.get("largest_call") or {}
+    scenarios = summarize_history_scenarios(metrics)
+    checks = {
+        "ordinary_correctness_within_20_calls": interactive["call_count"] <= MAX_CORRECTNESS_CALLS,
+        "largest_response_within_256_kib": int(largest.get("bytes", 0)) <= MAX_TURN_PAYLOAD_BYTES,
+        "scenario_call_budgets_met": all(item["within_call_budget"] for item in scenarios.values()),
+    }
+    return {"passed": all(checks.values()), "checks": checks, "scenarios": scenarios}
 
 
 def build_scores(interactive_summary: dict[str, Any]) -> dict[str, float]:
@@ -474,6 +527,7 @@ async def run_workflow(config: BenchmarkConfig) -> dict[str, Any]:
     pass_id: str | None = None
     event_id: int | None = None
     stage: str | None = None
+    investigation_id: str | None = None
 
     async with stdio_client(params) as streams:
         async with ClientSession(*streams) as session:
@@ -502,6 +556,13 @@ async def run_workflow(config: BenchmarkConfig) -> dict[str, Any]:
                     "renderdoc_get_analysis_worklist",
                     {"capture_id": capture_id, "focus": "performance", "limit": 10},
                     "analysis_worklist",
+                )
+                await _call_tool(
+                    session,
+                    metrics,
+                    "renderdoc_get_analysis_worklist",
+                    {"capture_id": capture_id, "focus": "correctness", "limit": 10},
+                    "correctness_worklist",
                 )
                 pass_id = _worklist_pass_id(worklist)
                 if pass_id is None:
@@ -547,45 +608,38 @@ async def run_workflow(config: BenchmarkConfig) -> dict[str, Any]:
                 await _call_tool(
                     session,
                     metrics,
-                    "renderdoc_list_actions",
-                    {"capture_id": capture_id, "limit": 50},
-                    "list_actions",
+                    "renderdoc_search_actions",
+                    {"capture_id": capture_id, "flags_filter": "draw", "limit": 50},
+                    "search_actions",
                 )
 
                 event_id = _representative_event_id(pass_summary)
                 if event_id is None:
                     raise RuntimeError("Benchmark workflow could not choose a representative event.")
 
-                await _call_tool(
-                    session,
-                    metrics,
-                    "renderdoc_get_action_summary",
-                    {"capture_id": capture_id, "event_id": event_id},
-                    "action_summary",
-                )
                 pipeline_overview = await _call_tool(
                     session,
                     metrics,
-                    "renderdoc_get_pipeline_overview",
-                    {"capture_id": capture_id, "event_id": event_id},
-                    "pipeline_overview",
-                )
-                await _call_tool(
-                    session,
-                    metrics,
-                    "renderdoc_list_pipeline_bindings",
+                    "renderdoc_get_event_dossier",
                     {
                         "capture_id": capture_id,
                         "event_id": event_id,
-                        "binding_kind": "descriptor_accesses",
-                        "limit": 50,
+                        "binding_kinds": [
+                            "descriptor_accesses",
+                            "output_targets",
+                            "shaders",
+                            "read_only_resources",
+                            "read_write_resources",
+                            "constant_blocks",
+                        ],
+                        "binding_limit": 50,
                     },
-                    "pipeline_bindings",
+                    "event_dossier",
                 )
 
                 stage = _shader_stage(pipeline_overview)
                 if stage is None:
-                    skipped_steps.extend(["shader_summary", "shader_code_chunk"])
+                    skipped_steps.extend(["shader_summary", "shader_search"])
                 else:
                     await _call_tool(
                         session,
@@ -597,15 +651,17 @@ async def run_workflow(config: BenchmarkConfig) -> dict[str, Any]:
                     await _call_tool(
                         session,
                         metrics,
-                        "renderdoc_get_shader_code_chunk",
+                        "renderdoc_search_shader_code",
                         {
                             "capture_id": capture_id,
                             "event_id": event_id,
                             "stage": stage,
-                            "start_line": 1,
-                            "line_count": 200,
+                            "query": "load|store|sample|atomic|discard",
+                            "regex": True,
+                            "context_lines": 1,
+                            "limit": 25,
                         },
-                        "shader_code_chunk",
+                        "shader_search",
                     )
 
                 resources = await _call_tool(
@@ -626,7 +682,63 @@ async def run_workflow(config: BenchmarkConfig) -> dict[str, Any]:
                         {"capture_id": capture_id, "resource_id": resource_id},
                         "resource_summary",
                     )
+                    await _call_tool(
+                        session,
+                        metrics,
+                        "renderdoc_search_resource_bindings",
+                        {
+                            "capture_id": capture_id,
+                            "resource_id": resource_id,
+                            "scan_limit": 25,
+                            "match_limit": 25,
+                        },
+                        "resource_binding_search",
+                    )
+
+                investigation = await _call_tool(
+                    session,
+                    metrics,
+                    "renderdoc_create_investigation",
+                    {"name": "benchmark", "capture_ids": [capture_id], "labels": ["baseline"]},
+                    "create_investigation",
+                )
+                investigation_id = str(investigation["investigation_id"])
+                await _call_tool(
+                    session,
+                    metrics,
+                    "renderdoc_set_investigation_focus",
+                    {"investigation_id": investigation_id, "capture_id": capture_id, "event_id": event_id},
+                    "set_investigation_focus",
+                )
+                await _call_tool(
+                    session,
+                    metrics,
+                    "renderdoc_list_investigations",
+                    {},
+                    "restore_investigation",
+                )
+                await _call_tool(
+                    session,
+                    metrics,
+                    "renderdoc_compare_events",
+                    {
+                        "baseline_capture_id": capture_id,
+                        "baseline_event_id": event_id,
+                        "candidate_capture_id": capture_id,
+                        "candidate_event_id": event_id,
+                        "max_changes": 50,
+                    },
+                    "compare_events",
+                )
             finally:
+                if investigation_id:
+                    await _call_tool(
+                        session,
+                        metrics,
+                        "renderdoc_close_investigation",
+                        {"investigation_id": investigation_id},
+                        "close_investigation",
+                    )
                 await _call_tool(
                     session,
                     metrics,
@@ -637,6 +749,7 @@ async def run_workflow(config: BenchmarkConfig) -> dict[str, Any]:
 
     stages = {name: summarize_metrics(metrics, labels) for name, labels in STAGE_GROUPS.items()}
     scores = build_scores(stages["interactive"])
+    acceptance = build_acceptance(metrics, stages)
     return {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "workflow_version": WORKFLOW_VERSION,
@@ -648,6 +761,7 @@ async def run_workflow(config: BenchmarkConfig) -> dict[str, Any]:
             "bridge_timeout_seconds": config.timeout_seconds,
         },
         "scores": scores,
+        "acceptance": acceptance,
         "summary": {
             "stages": stages,
             "skipped_steps": skipped_steps,

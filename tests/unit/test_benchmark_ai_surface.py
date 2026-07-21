@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from renderdoc_mcp.benchmark_ai_surface import (
     WORKFLOW_VERSION,
+    CallMetric,
+    build_acceptance,
     build_delta,
     build_ref_comparison,
     build_scores,
     find_previous_entry,
     sanitize_call_args,
+    summarize_history_scenarios,
 )
 
 
@@ -153,3 +156,37 @@ def test_sanitize_call_args_redacts_local_paths() -> None:
     assert sanitized["capture_path"] == "<redacted>"
     assert sanitized["capture_id"] == "abc123"
     assert sanitized["event_id"] == 42
+
+
+def test_history_scenarios_encode_call_budgets_from_real_workflows() -> None:
+    metrics = [
+        CallMetric("search_actions", "renderdoc_search_actions", {}, 1.0, 100, 25),
+        CallMetric("correctness_worklist", "renderdoc_get_analysis_worklist", {}, 1.0, 100, 25),
+        CallMetric("event_dossier", "renderdoc_get_event_dossier", {}, 1.0, 100, 25),
+        CallMetric("shader_summary", "renderdoc_get_shader_summary", {}, 1.0, 100, 25),
+        CallMetric("shader_search", "renderdoc_search_shader_code", {}, 1.0, 100, 25),
+    ]
+
+    scenarios = summarize_history_scenarios(metrics)
+
+    assert scenarios["nested_action_discovery"]["within_call_budget"] is True
+    assert scenarios["correctness_event_dossier"]["call_count"] == 2
+    assert scenarios["shader_root_cause"]["within_call_budget"] is True
+
+
+def test_acceptance_rejects_a_response_over_256_kib() -> None:
+    metrics = [CallMetric("event_dossier", "renderdoc_get_event_dossier", {}, 1.0, 300_000, 75_000)]
+    stages = {
+        "interactive": {
+            "call_count": 1,
+            "total_bytes": 300_000,
+            "approx_tokens": 75_000,
+            "total_elapsed_ms": 1.0,
+            "largest_call": {"bytes": 300_000},
+        }
+    }
+
+    acceptance = build_acceptance(metrics, stages)
+
+    assert acceptance["checks"]["largest_response_within_256_kib"] is False
+    assert acceptance["passed"] is False

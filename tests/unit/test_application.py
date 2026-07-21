@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from renderdoc_mcp.application import RenderDocApplication
+from renderdoc_mcp.application.compare import compare_event_dossiers
 from renderdoc_mcp.application.registry import build_resource_registry, build_tool_registry
 from renderdoc_mcp.errors import InvalidCaptureIDError, RenderDocMCPError, ReplayFailureError
 from renderdoc_mcp.session_pool import CaptureSessionPool
@@ -17,6 +18,8 @@ class DummyBridge:
         self.closed = 0
         self.backend_name = "qrenderdoc"
         self.renderdoc_version = "1.43"
+        self.action_name = "Draw"
+        self.texture_value = 0.0
 
     def ensure_capture_loaded(self, capture_path: str):
         self.loaded.append(capture_path)
@@ -124,7 +127,7 @@ class DummyBridge:
             return {
                 "action": {
                     "event_id": payload["event_id"],
-                    "name": "Draw",
+                    "name": self.action_name,
                     "flags": ["draw"],
                     "depth": 2,
                     "child_count": 0,
@@ -132,6 +135,11 @@ class DummyBridge:
                     "resource_usage_summary": {"output_count": 1, "has_depth_output": True},
                 },
                 "meta": {},
+            }
+        if method == "search_actions":
+            return {
+                "actions": [{"event_id": 42, "name": self.action_name, "flags": ["draw"]}],
+                "meta": {"page": {"limit": payload["limit"], "returned_count": 1, "has_more": False}},
             }
         if method == "get_pipeline_overview":
             return {
@@ -154,6 +162,32 @@ class DummyBridge:
                     "api_details_available": True,
                     "api_details_api": "D3D12",
                 },
+                "meta": {},
+            }
+        if method == "get_event_dossier":
+            return {
+                "event_id": payload["event_id"],
+                "api": "D3D12",
+                "action": {"event_id": payload["event_id"], "name": self.action_name, "flags": ["draw"]},
+                "pass": {"pass_id": "pass:1-10", "name": "BasePass", "category": "geometry"},
+                "pipeline": {
+                    "available": True,
+                    "topology": "TriangleList",
+                    "counts": {"shaders": 2},
+                    "shaders": [{"stage": "Pixel", "shader_id": "shader-1", "shader_name": "MainPS"}],
+                },
+                "bindings": {
+                    kind: {"items": [], "returned_count": 0, "total_count": 0, "truncated": False}
+                    for kind in payload.get("binding_kinds", [])
+                },
+                "meta": {},
+            }
+        if method == "get_event_dossiers":
+            return {
+                "items": [{"event_id": event_id, "ok": True, "dossier": {"event_id": event_id}} for event_id in payload["event_ids"]],
+                "requested_count": len(payload["event_ids"]),
+                "success_count": len(payload["event_ids"]),
+                "error_count": 0,
                 "meta": {},
             }
         if method == "list_pipeline_bindings":
@@ -193,6 +227,14 @@ class DummyBridge:
                 "reason": "",
                 "text": "shader",
                 "meta": {},
+            }
+        if method == "search_shader_code":
+            return {
+                "event_id": payload["event_id"],
+                "query": payload["query"],
+                "total_match_count": 1,
+                "matches": [{"line_number": 7, "line": "sample", "context_text": "sample"}],
+                "meta": {"page": {"returned_count": 1, "has_more": False}},
             }
         if method == "list_resources":
             return {
@@ -275,6 +317,14 @@ class DummyBridge:
                         "has_more": False,
                     }
                 },
+            }
+        if method == "search_resource_bindings":
+            return {
+                "resource": {"resource_id": payload["resource_id"]},
+                "matches": [],
+                "matched_event_count": 0,
+                "matched_binding_count": 0,
+                "meta": {"scan": {"scanned_count": 0, "has_more": False}},
             }
         if method == "get_pixel_history":
             return {
@@ -398,6 +448,12 @@ class DummyBridge:
                 "returned_state_count": 0,
                 "meta": {"completed": True, "has_more": False},
             }
+        if method == "analyze_shader_debug":
+            return {
+                "shader_debug_id": payload["shader_debug_id"],
+                "analysis": {"analyzed_state_count": 12, "interesting_steps": []},
+                "meta": {"completed": True, "has_more": False},
+            }
         if method == "get_shader_debug_step":
             return {
                 "shader_debug_id": payload["shader_debug_id"],
@@ -409,7 +465,14 @@ class DummyBridge:
         if method == "end_shader_debug":
             return {"shader_debug_id": payload["shader_debug_id"], "closed": True, "meta": {}}
         if method == "get_texture_data":
-            return {"texture": {"resource_id": payload["texture_id"]}, "pixels": [], "meta": {}}
+            return {
+                "texture": {"resource_id": payload["texture_id"]},
+                "pixels": [
+                    [[self.texture_value, 0.0, 0.0, 1.0] for _ in range(payload["width"])]
+                    for _ in range(payload["height"])
+                ],
+                "meta": {},
+            }
         if method == "get_buffer_data":
             return {
                 "buffer": {"resource_id": payload["buffer_id"]},
@@ -448,9 +511,26 @@ def test_open_capture_returns_capture_id_and_overview(tmp_path: Path) -> None:
     assert response["capture_path"] == capture_path
     assert response["api"] == "D3D12"
     assert response["root_pass_count"] == 1
+    assert response["session_reused"] is False
     assert response["meta"] == {"backend": "qrenderdoc", "renderdoc_version": "1.43"}
     assert created[0].loaded == [capture_path]
     assert created[0].calls == [("get_capture_overview", {})]
+
+
+def test_open_capture_is_idempotent_and_lists_the_reused_session(tmp_path: Path) -> None:
+    application, created = _application()
+    capture_path = _capture(tmp_path)
+
+    first = application.captures.renderdoc_open_capture(capture_path)
+    second = application.captures.renderdoc_open_capture(capture_path)
+    opened = application.captures.renderdoc_list_open_captures()
+
+    assert second["capture_id"] == first["capture_id"]
+    assert second["session_reused"] is True
+    assert second["session_open_count"] == 2
+    assert opened["count"] == 1
+    assert opened["captures"][0]["capture_id"] == first["capture_id"]
+    assert len(created) == 1
 
 
 def test_handlers_reuse_capture_id_session_and_attach_meta(tmp_path: Path) -> None:
@@ -492,6 +572,17 @@ def test_close_capture_invalidates_session(tmp_path: Path) -> None:
         application.captures.renderdoc_get_capture_overview(opened["capture_id"])
 
 
+def test_invalid_capture_id_reports_reusable_sessions(tmp_path: Path) -> None:
+    application, _ = _application()
+    opened = application.captures.renderdoc_open_capture(_capture(tmp_path))
+
+    with pytest.raises(InvalidCaptureIDError) as caught:
+        application.captures.renderdoc_get_capture_overview("deadbeef")
+
+    assert caught.value.details["available_capture_ids"] == [opened["capture_id"]]
+    assert caught.value.details["suggested_call"]["tool"] == "renderdoc_list_open_captures"
+
+
 def test_analysis_worklist_uses_distinct_bridge_method(tmp_path: Path) -> None:
     application, created = _application()
     capture_path = _capture(tmp_path)
@@ -501,6 +592,107 @@ def test_analysis_worklist_uses_distinct_bridge_method(tmp_path: Path) -> None:
 
     assert response["focus"] == "structure"
     assert created[0].calls[-1] == ("get_analysis_worklist", {"focus": "structure", "limit": 5})
+
+
+def test_recursive_search_dossiers_and_semantic_aliases_forward_compact_calls(tmp_path: Path) -> None:
+    application, created = _application()
+    opened = application.captures.renderdoc_open_capture(_capture(tmp_path))
+
+    searched = application.actions.renderdoc_search_actions(
+        opened["capture_id"],
+        query="draw",
+        flags_filter="draw",
+        resource_id="ResourceId::1",
+        limit=10,
+    )
+    dossier = application.actions.renderdoc_get_event_dossier(
+        opened["capture_id"],
+        42,
+        binding_kinds=["resources", "constant_buffers"],
+    )
+    batch = application.actions.renderdoc_get_event_dossiers(opened["capture_id"], [42, 43])
+
+    assert searched["actions"][0]["event_id"] == 42
+    assert set(dossier["bindings"]) == {"read_only_resources", "constant_blocks"}
+    assert batch["success_count"] == 2
+    assert created[0].calls[-3:] == [
+        (
+            "search_actions",
+            {
+                "limit": 10,
+                "query": "draw",
+                "flags_filter": "draw",
+                "resource_id": "ResourceId::1",
+            },
+        ),
+        (
+            "get_event_dossier",
+            {
+                "event_id": 42,
+                "binding_kinds": ["read_only_resources", "constant_blocks"],
+                "binding_limit": 20,
+            },
+        ),
+        (
+            "get_event_dossiers",
+            {"event_ids": [42, 43], "binding_kinds": ["output_targets", "shaders"], "binding_limit": 20},
+        ),
+    ]
+
+
+def test_shader_and_resource_server_side_search_handlers(tmp_path: Path) -> None:
+    application, created = _application()
+    opened = application.captures.renderdoc_open_capture(_capture(tmp_path))
+
+    shader = application.actions.renderdoc_search_shader_code(
+        opened["capture_id"],
+        42,
+        "Pixel",
+        "sample",
+        regex="false",  # type: ignore[arg-type]
+        context_lines="3",  # type: ignore[arg-type]
+    )
+    resource = application.resources.renderdoc_search_resource_bindings(
+        opened["capture_id"],
+        "ResourceId::1",
+        event_id_min="10",  # type: ignore[arg-type]
+        event_id_max="100",  # type: ignore[arg-type]
+    )
+    trace = application.resources.renderdoc_analyze_shader_debug(opened["capture_id"], "debug-1")
+
+    assert shader["total_match_count"] == 1
+    assert resource["matched_event_count"] == 0
+    assert trace["analysis"]["analyzed_state_count"] == 12
+    assert created[0].calls[-3:] == [
+        (
+            "search_shader_code",
+            {
+                "event_id": 42,
+                "stage": "Pixel",
+                "query": "sample",
+                "regex": False,
+                "case_sensitive": False,
+                "context_lines": 3,
+                "cursor": 0,
+                "limit": 25,
+            },
+        ),
+        (
+            "search_resource_bindings",
+            {
+                "resource_id": "ResourceId::1",
+                "cursor": 0,
+                "scan_limit": 100,
+                "match_limit": 50,
+                "event_id_min": 10,
+                "event_id_max": 100,
+            },
+        ),
+        (
+            "analyze_shader_debug",
+            {"shader_debug_id": "debug-1", "max_steps": 4096, "max_interesting_steps": 32},
+        ),
+    ]
 
 
 def test_buffer_reads_default_to_hex(tmp_path: Path) -> None:
@@ -542,14 +734,19 @@ def test_pipeline_binding_aliases_normalize_before_forwarding(tmp_path: Path) ->
     descriptors = application.actions.renderdoc_list_pipeline_bindings(
         opened["capture_id"], event_id=7, binding_kind="descriptors"
     )
+    buffers = application.actions.renderdoc_list_pipeline_bindings(
+        opened["capture_id"], event_id=7, binding_kind="buffers"
+    )
     api = application.actions.renderdoc_list_pipeline_bindings(opened["capture_id"], event_id=7, binding_kind="api")
 
     assert outputs["binding_kind"] == "output_targets"
     assert descriptors["binding_kind"] == "descriptor_accesses"
+    assert buffers["binding_kind"] == "vertex_buffers"
     assert api["binding_kind"] == "api_details"
-    assert created[0].calls[-3:] == [
+    assert created[0].calls[-4:] == [
         ("list_pipeline_bindings", {"event_id": 7, "binding_kind": "output_targets", "limit": 50}),
         ("list_pipeline_bindings", {"event_id": 7, "binding_kind": "descriptor_accesses", "limit": 50}),
+        ("list_pipeline_bindings", {"event_id": 7, "binding_kind": "vertex_buffers", "limit": 50}),
         ("list_pipeline_bindings", {"event_id": 7, "binding_kind": "api_details", "limit": 50}),
     ]
 
@@ -786,10 +983,157 @@ def test_registry_contains_new_breaking_api_surface() -> None:
         "renderdoc_start_pixel_shader_debug",
         "renderdoc_start_compute_shader_debug",
         "renderdoc_continue_shader_debug",
+        "renderdoc_list_investigations",
         "renderdoc_get_shader_debug_step",
         "renderdoc_end_shader_debug",
     }.issubset(tool_names)
     assert "renderdoc://capture/{capture_id}/overview" in resource_uris
+
+
+def test_investigation_restores_focus_and_pinned_evidence(tmp_path: Path) -> None:
+    application, _ = _application()
+    opened = application.captures.renderdoc_open_capture(_capture(tmp_path))
+
+    created = application.investigation.renderdoc_create_investigation(
+        "Regression",
+        capture_ids=[opened["capture_id"]],
+        labels=["baseline"],
+    )
+    focused = application.investigation.renderdoc_set_investigation_focus(
+        created["investigation_id"],
+        capture_id=opened["capture_id"],
+        event_id=42,
+        texture_id="ResourceId::1",
+        x=3,
+        y=4,
+    )
+    pinned = application.investigation.renderdoc_pin_investigation_evidence(
+        created["investigation_id"],
+        "writer",
+        "event",
+        "42",
+        "Final writer",
+        capture_id=opened["capture_id"],
+    )
+    restored = application.investigation.renderdoc_get_investigation_summary(created["investigation_id"])
+    listed = application.investigation.renderdoc_list_investigations()
+
+    assert focused["focus"]["event_id"] == 42
+    assert pinned["evidence"]["writer"]["summary"] == "Final writer"
+    assert restored["captures"]["baseline"]["open"] is True
+    assert restored["recommended_calls"][0]["tool"] == "renderdoc_get_event_dossier"
+    assert listed["investigations"][0]["investigation_id"] == created["investigation_id"]
+    assert listed["investigations"][0]["focus"]["event_id"] == 42
+
+
+def test_investigation_focus_auto_attaches_capture_and_rejects_duplicate_labels(tmp_path: Path) -> None:
+    application, _ = _application()
+    baseline = application.captures.renderdoc_open_capture(_capture(tmp_path, "baseline.rdc"))
+    candidate = application.captures.renderdoc_open_capture(_capture(tmp_path, "candidate.rdc"))
+    created = application.investigation.renderdoc_create_investigation("Auto attach")
+
+    focused = application.investigation.renderdoc_set_investigation_focus(
+        created["investigation_id"],
+        capture_id=baseline["capture_id"],
+        event_id=42,
+    )
+
+    assert focused["captures"]["baseline"]["capture_id"] == baseline["capture_id"]
+    with pytest.raises(ReplayFailureError, match="labels must be unique"):
+        application.investigation.renderdoc_create_investigation(
+            "Duplicates",
+            capture_ids=[baseline["capture_id"], candidate["capture_id"]],
+            labels=["same", "same"],
+        )
+
+
+def test_cross_capture_event_and_texture_diffs_are_compact(tmp_path: Path) -> None:
+    application, created = _application()
+    baseline = application.captures.renderdoc_open_capture(_capture(tmp_path, "baseline.rdc"))
+    candidate = application.captures.renderdoc_open_capture(_capture(tmp_path, "candidate.rdc"))
+    created[1].action_name = "Changed Draw"
+    created[1].texture_value = 0.25
+
+    event_diff = application.investigation.renderdoc_compare_events(
+        baseline["capture_id"],
+        42,
+        candidate["capture_id"],
+        84,
+    )
+    texture_diff = application.investigation.renderdoc_compare_texture_regions(
+        baseline["capture_id"],
+        "ResourceId::A",
+        candidate["capture_id"],
+        "ResourceId::B",
+        x=0,
+        y=0,
+        width=2,
+        height=2,
+        threshold=0.01,
+    )
+
+    assert event_diff["equivalent"] is False
+    assert any(change["path"].endswith(".name") for change in event_diff["changes"])
+    assert "baseline_snapshot" not in event_diff
+    assert texture_diff["summary"]["changed_pixel_count"] == 4
+    assert texture_diff["summary"]["max_finite_abs_difference"] == 0.25
+    assert len(texture_diff["top_changed_pixels"]) == 4
+
+
+def test_event_diff_only_marks_truncated_when_an_additional_change_exists() -> None:
+    one_change = compare_event_dossiers(
+        {"action": {"name": "before"}},
+        {"action": {"name": "after"}},
+        max_changes=1,
+    )
+    two_changes = compare_event_dossiers(
+        {"action": {"name": "before", "index_count": 3}},
+        {"action": {"name": "after", "index_count": 6}},
+        max_changes=1,
+    )
+
+    assert one_change["change_count"] == 1
+    assert one_change["changes_truncated"] is False
+    assert two_changes["change_count"] == 1
+    assert two_changes["changes_truncated"] is True
+
+
+def test_event_diff_ignores_volatile_ids_across_captures() -> None:
+    baseline = {
+        "action": {"event_id": 10, "name": "Draw"},
+        "pass": {"pass_id": "pass:1-10", "start_event_id": 1, "end_event_id": 10, "name": "BasePass"},
+        "pipeline": {"graphics_pipeline_object": "pipe-a", "shaders": [{"shader_id": "shader-a", "shader_name": "MainPS"}]},
+        "bindings": {"output_targets": {"items": [{"resource_id": "texture-a", "resource_name": "SceneColor"}]}},
+    }
+    candidate = {
+        "action": {"event_id": 20, "name": "Draw"},
+        "pass": {"pass_id": "pass:11-20", "start_event_id": 11, "end_event_id": 20, "name": "BasePass"},
+        "pipeline": {"graphics_pipeline_object": "pipe-b", "shaders": [{"shader_id": "shader-b", "shader_name": "MainPS"}]},
+        "bindings": {"output_targets": {"items": [{"resource_id": "texture-b", "resource_name": "SceneColor"}]}},
+    }
+
+    comparison = compare_event_dossiers(baseline, candidate)
+
+    assert comparison["equivalent"] is True
+    assert comparison["changes"] == []
+
+
+def test_server_status_is_read_only_and_reports_extension_freshness(tmp_path: Path, monkeypatch) -> None:
+    application, _ = _application()
+    executable = tmp_path / "qrenderdoc.exe"
+    executable.write_text("x", encoding="utf-8")
+    monkeypatch.setattr("renderdoc_mcp.application.handlers.captures.current_backend_name", lambda: "qrenderdoc")
+    monkeypatch.setattr("renderdoc_mcp.application.handlers.captures.resolve_qrenderdoc_path", lambda: executable)
+    monkeypatch.setattr(
+        "renderdoc_mcp.application.handlers.captures.inspect_extension_install",
+        lambda: {"path": "extension", "installed": True, "current": True},
+    )
+
+    status = application.captures.renderdoc_get_server_status()
+
+    assert status["ready"] is True
+    assert status["backend"]["qrenderdoc_path"] == str(executable)
+    assert status["extension"]["current"] is True
 
 
 def test_recent_captures_reports_backend_meta(tmp_path: Path, monkeypatch) -> None:

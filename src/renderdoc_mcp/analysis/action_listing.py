@@ -132,6 +132,86 @@ def build_action_summary_result(analysis_cache, event_id):
     return {"action": action_summary(node), "meta": {}}
 
 
+def build_action_search_result(
+    analysis_cache,
+    parent_event_id=None,
+    query=None,
+    flags_filter=None,
+    resource_id=None,
+    event_id_min=None,
+    event_id_max=None,
+    cursor=None,
+    limit=None,
+):
+    action_index = analysis_cache.get("action_index", {})
+    children_index = analysis_cache.get("action_children_index", {})
+    parent_key = "" if parent_event_id in (None, "") else str(int(parent_event_id))
+    if parent_key and int(parent_key) not in action_index:
+        return None
+
+    candidate_ids = []  # type: list[int]
+    _collect_descendant_action_ids(children_index, parent_key, candidate_ids)
+    query_lower = _lower(query)
+    required_flags = {item for item in (_lower(flags_filter) or "").replace(",", " ").split() if item}
+    normalized_resource_id = str(resource_id or "").strip()
+    resource_rows = analysis_cache.get("resource_usage_index", {}).get(normalized_resource_id, [])
+    resource_usage_by_event = {
+        int(row["event_id"]): list(row.get("matched_usage_kinds", []))
+        for row in resource_rows
+    }
+
+    matches = []
+    for event_id in candidate_ids:
+        node = action_index.get(int(event_id))
+        if node is None:
+            continue
+        entry = compact_action_entry(node)
+        if query_lower and query_lower not in entry["name"].lower():
+            continue
+        if required_flags and not required_flags.issubset(set(entry["flags"])):
+            continue
+        if event_id_min is not None and int(event_id) < int(event_id_min):
+            continue
+        if event_id_max is not None and int(event_id) > int(event_id_max):
+            continue
+        if normalized_resource_id and int(event_id) not in resource_usage_by_event:
+            continue
+        if normalized_resource_id:
+            entry["matched_resource_usage_kinds"] = resource_usage_by_event[int(event_id)]
+        matches.append(entry)
+
+    page_limit = int(limit if limit is not None else DEFAULT_ACTION_PAGE_LIMIT)
+    offset = int(cursor or 0)
+    page = matches[offset : offset + page_limit]
+    next_offset = offset + len(page)
+    has_more = next_offset < len(matches)
+
+    return with_meta(
+        {
+            "parent_event_id": parent_key,
+            "query": query or "",
+            "flags_filter": " ".join(sorted(required_flags)),
+            "resource_id": normalized_resource_id,
+            "event_id_min": event_id_min,
+            "event_id_max": event_id_max,
+            "actions": page,
+        },
+        page=PageInfo(
+            cursor=str(offset),
+            next_cursor=str(next_offset) if has_more else "",
+            limit=page_limit,
+            returned_count=len(page),
+            total_count=len(candidate_ids),
+            matched_count=len(matches),
+            has_more=has_more,
+        ),
+        extra_meta={
+            "search_scope": "recursive_descendants",
+            "resource_filter_coverage": "rt_texture_v1" if normalized_resource_id else "",
+        },
+    )
+
+
 def _filter_action_tree(nodes, max_depth, name_filter_lower, depth):
     payload = []
     for node in nodes:
@@ -196,6 +276,12 @@ def _take_action_tree_preview(nodes, budget):
             }
         )
     return payload
+
+
+def _collect_descendant_action_ids(children_index, parent_key, output):
+    for event_id in children_index.get(parent_key, []):
+        output.append(int(event_id))
+        _collect_descendant_action_ids(children_index, str(int(event_id)), output)
 
 
 def _lower(value):

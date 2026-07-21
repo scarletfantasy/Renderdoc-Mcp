@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from renderdoc_mcp.application.context import ApplicationContext
-from renderdoc_mcp.application.handlers import ActionHandlers, CaptureHandlers, ResourceHandlers
+from renderdoc_mcp.application.handlers import ActionHandlers, CaptureHandlers, InvestigationHandlers, ResourceHandlers
 from renderdoc_mcp.session_pool import CaptureSessionPool
 
 
@@ -14,3 +14,4 @@ class RenderDocApplication:
         self.captures = CaptureHandlers(self.context)
         self.actions = ActionHandlers(self.context)
         self.resources = ResourceHandlers(self.context)
+        self.investigation = InvestigationHandlers(self.context)

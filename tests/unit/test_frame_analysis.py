@@ -191,6 +191,41 @@ def test_list_actions_returns_direct_children_only() -> None:
     assert [item["event_id"] for item in scene_children["actions"]] == [30]
 
 
+def test_search_actions_recurses_and_can_filter_known_resource_writes() -> None:
+    nodes = [
+        _action(
+            10,
+            "Scene",
+            ["push_marker"],
+            children=[
+                _action(
+                    20,
+                    "BasePass",
+                    ["push_marker"],
+                    children=[
+                        _action(21, "Opaque Draw", ["draw"], outputs=[_resource("SceneColor")]),
+                        _action(22, "Other Draw", ["draw"], outputs=[_resource("Other")]),
+                    ],
+                )
+            ],
+        )
+    ]
+    analysis = frame_analysis.build_frame_analysis(nodes, _metadata(nodes))
+
+    result = frame_analysis.build_action_search_result(
+        analysis,
+        query="opaque",
+        flags_filter="draw",
+        resource_id="scenecolor",
+        limit=50,
+    )
+
+    assert result is not None
+    assert [item["event_id"] for item in result["actions"]] == [21]
+    assert result["actions"][0]["matched_resource_usage_kinds"] == ["color_output"]
+    assert result["meta"]["search_scope"] == "recursive_descendants"
+
+
 def test_list_timing_events_pages_gpu_rows() -> None:
     nodes = [
         _action(

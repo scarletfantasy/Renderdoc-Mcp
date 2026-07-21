@@ -83,11 +83,27 @@ class CapturePathError(RenderDocMCPError):
 
 
 class InvalidCaptureIDError(RenderDocMCPError):
-    def __init__(self, capture_id: str) -> None:
+    def __init__(self, capture_id: str, available_capture_ids: list[str] | None = None) -> None:
+        details: dict[str, Any] = {"capture_id": capture_id}
+        if available_capture_ids is not None:
+            details["available_capture_ids"] = available_capture_ids
+            details["suggested_call"] = {"tool": "renderdoc_list_open_captures", "arguments": {}}
         super().__init__(
             "invalid_capture_id",
             "The supplied capture_id does not exist or has already been closed.",
-            {"capture_id": capture_id},
+            details,
+        )
+
+
+class InvalidInvestigationIDError(RenderDocMCPError):
+    def __init__(self, investigation_id: str, available_investigation_ids: list[str] | None = None) -> None:
+        super().__init__(
+            "invalid_investigation_id",
+            "The supplied investigation_id does not exist or has already been closed.",
+            {
+                "investigation_id": investigation_id,
+                "available_investigation_ids": available_investigation_ids or [],
+            },
         )
 
 

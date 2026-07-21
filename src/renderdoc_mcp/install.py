@@ -317,6 +317,21 @@ def install_extension(always_load: bool | None = None) -> Path:
     return target_dir
 
 
+def inspect_extension_install() -> dict[str, object]:
+    target_dir = extension_install_dir()
+    expected = _build_install_metadata()
+    installed = _read_install_metadata(target_dir)
+    installed_files = installed.get("files") if installed is not None else None
+    return {
+        "path": str(target_dir),
+        "installed": target_dir.is_dir(),
+        "current": _install_is_current(target_dir, expected),
+        "expected_source_hash": expected.get("source_hash"),
+        "installed_source_hash": installed.get("source_hash") if installed is not None else None,
+        "installed_file_count": len(installed_files) if isinstance(installed_files, list) else 0,
+    }
+
+
 def _sync_shared_analysis_package(target_dir: Path) -> None:
     source_root = resources.files(SHARED_ANALYSIS_PACKAGE)
     destination = target_dir / SHARED_ANALYSIS_TARGET_DIR

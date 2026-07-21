@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from renderdoc_mcp.application.services import CaptureSessionService, InputNormalizer, UIConfigRepository
+from renderdoc_mcp.application.services import (
+    CaptureSessionService,
+    InputNormalizer,
+    InvestigationRepository,
+    UIConfigRepository,
+)
 from renderdoc_mcp.paths import ui_config_path
 from renderdoc_mcp.session_pool import CaptureSession, CaptureSessionPool
 
@@ -14,10 +19,12 @@ class ApplicationContext:
         sessions: CaptureSessionService | None = None,
         normalizer: InputNormalizer | None = None,
         ui_config: UIConfigRepository | None = None,
+        investigations: InvestigationRepository | None = None,
     ) -> None:
         self.normalizer = normalizer or InputNormalizer()
         self.sessions = sessions or CaptureSessionService(session_pool=session_pool, normalizer=self.normalizer)
         self.ui_config = ui_config or UIConfigRepository()
+        self.investigations = investigations or InvestigationRepository()
 
     def open_capture(self, capture_path: str) -> CaptureSession:
         return self.sessions.open_capture(capture_path)

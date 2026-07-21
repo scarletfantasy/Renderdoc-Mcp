@@ -7,13 +7,42 @@ from renderdoc_mcp.analysis.frame_analysis import MAX_PAGE_LIMIT, MAX_TIMING_EVE
 from renderdoc_mcp.application.command_specs import GetResourceSummaryCommand
 from renderdoc_mcp.application.context import ApplicationContext
 from renderdoc_mcp.application.response import attach_capture, ensure_meta
+from renderdoc_mcp.application.schema_types import (
+    BufferEncoding,
+    BufferReadSize,
+    CaptureId,
+    Cursor,
+    EventId,
+    NonNegativeInt,
+    PageLimit,
+    ResourceBindingMatchLimit,
+    ResourceBindingScanLimit,
+    ResourceId,
+    ResourceKind,
+    ResourceSort,
+    ResourceUsageKind,
+    ShaderDebugAnalysisLimit,
+    ShaderDebugChangeLimit,
+    ShaderDebugId,
+    ShaderDebugInterestingLimit,
+    ShaderDebugStateLimit,
+    TexturePreviewDimension,
+    TextureProbeCandidateLimit,
+    TextureProbeChannel,
+    TextureProbeDimension,
+    TextureProbeRegionLimit,
+    TextureProbeRegionPixels,
+    TextureProbeThreshold,
+    TimingPageLimit,
+)
 from renderdoc_mcp.errors import ReplayFailureError
 
 SUPPORTED_RESOURCE_KINDS = {"all", "textures", "buffers"}
 SUPPORTED_RESOURCE_USAGE_KINDS = {"all", *RESOURCE_USAGE_KINDS}
 SUPPORTED_RESOURCE_SORT_OPTIONS = {"name", "size"}
 SUPPORTED_BUFFER_ENCODINGS = {"hex", "base64"}
-SUPPORTED_TEXTURE_PROBE_CHANNEL_MODES = {"luma", "max_rgb", "alpha", "any"}
+SUPPORTED_TEXTURE_PROBE_CHANNEL_MODES = {"luma", "max_rgb", "alpha", "any", "nan_inf", "local_outlier", "gradient"}
+RESOURCE_KIND_ALIASES = {"texture": "textures", "buffer": "buffers"}
 DEFAULT_RESOURCE_PAGE_LIMIT = 50
 DEFAULT_PIXEL_HISTORY_LIMIT = 100
 DEFAULT_BUFFER_READ_SIZE = 256
@@ -47,14 +76,15 @@ class ResourceHandlers:
 
     def renderdoc_list_resources(
         self,
-        capture_id: str,
-        kind: str = "all",
-        cursor: int | str | None = None,
-        limit: int | str | None = None,
+        capture_id: CaptureId,
+        kind: ResourceKind = "all",
+        cursor: Cursor | None = None,
+        limit: PageLimit | None = None,
         name_filter: str | None = None,
-        sort_by: str | None = None,
+        sort_by: ResourceSort | None = None,
     ) -> dict[str, Any]:
-        normalized_kind = self.context.normalize_optional_string(kind) or "all"
+        normalized_kind = (self.context.normalize_optional_string(kind) or "all").lower()
+        normalized_kind = RESOURCE_KIND_ALIASES.get(normalized_kind, normalized_kind)
         normalized_cursor = self.context.normalize_optional_int(cursor, "cursor")
         normalized_limit = self.context.normalize_optional_int(limit, "limit")
         normalized_name_filter = self.context.normalize_optional_string(name_filter)
@@ -63,7 +93,11 @@ class ResourceHandlers:
         if normalized_kind not in SUPPORTED_RESOURCE_KINDS:
             raise ReplayFailureError(
                 "kind must be one of 'all', 'textures', or 'buffers'.",
-                {"kind": normalized_kind},
+                {
+                    "kind": normalized_kind,
+                    "supported_values": sorted(SUPPORTED_RESOURCE_KINDS),
+                    "aliases": dict(sorted(RESOURCE_KIND_ALIASES.items())),
+                },
             )
         if normalized_sort_by not in SUPPORTED_RESOURCE_SORT_OPTIONS:
             raise ReplayFailureError(
@@ -85,7 +119,7 @@ class ResourceHandlers:
         session, result = self.context.capture_tool(capture_id, "list_resources", params)
         return attach_capture(ensure_meta(result), session)
 
-    def renderdoc_get_resource_summary(self, capture_id: str, resource_id: str) -> dict[str, Any]:
+    def renderdoc_get_resource_summary(self, capture_id: CaptureId, resource_id: ResourceId) -> dict[str, Any]:
         command = GetResourceSummaryCommand.from_raw(self.context.normalizer, capture_id, resource_id)
         session, result = self.context.sessions.capture_tool_normalized(
             command.capture_id,
@@ -96,11 +130,11 @@ class ResourceHandlers:
 
     def renderdoc_list_resource_usages(
         self,
-        capture_id: str,
-        resource_id: str,
-        usage_kind: str = "all",
-        cursor: int | str | None = None,
-        limit: int | str | None = None,
+        capture_id: CaptureId,
+        resource_id: ResourceId,
+        usage_kind: ResourceUsageKind = "all",
+        cursor: Cursor | None = None,
+        limit: PageLimit | None = None,
     ) -> dict[str, Any]:
         normalized_resource_id = self.context.normalize_required_string(resource_id, "resource_id")
         normalized_usage_kind = (self.context.normalize_optional_string(usage_kind) or "all").lower()
@@ -125,17 +159,61 @@ class ResourceHandlers:
         session, result = self.context.capture_tool(capture_id, "list_resource_usages", params)
         return attach_capture(ensure_meta(result), session)
 
+    def renderdoc_search_resource_bindings(
+        self,
+        capture_id: CaptureId,
+        resource_id: ResourceId,
+        event_id_min: EventId | None = None,
+        event_id_max: EventId | None = None,
+        cursor: Cursor | None = None,
+        scan_limit: ResourceBindingScanLimit | None = None,
+        match_limit: ResourceBindingMatchLimit | None = None,
+    ) -> dict[str, Any]:
+        normalized_min = self.context.normalize_optional_int(event_id_min, "event_id_min")
+        normalized_max = self.context.normalize_optional_int(event_id_max, "event_id_max")
+        normalized_cursor = self.context.normalize_optional_int(cursor, "cursor")
+        normalized_scan_limit = self.context.normalize_optional_int(scan_limit, "scan_limit")
+        normalized_match_limit = self.context.normalize_optional_int(match_limit, "match_limit")
+        if normalized_min is not None and normalized_max is not None and normalized_min > normalized_max:
+            raise ReplayFailureError(
+                "event_id_min must be less than or equal to event_id_max.",
+                {"event_id_min": normalized_min, "event_id_max": normalized_max},
+            )
+        for field_name, value in (("event_id_min", normalized_min), ("event_id_max", normalized_max)):
+            if value is not None and value <= 0:
+                raise ReplayFailureError(f"{field_name} must be greater than 0.", {field_name: value})
+        self.context.normalizer.validate_pagination(normalized_cursor, normalized_scan_limit, 500)
+        if normalized_match_limit is not None and (
+            normalized_match_limit <= 0 or normalized_match_limit > 100
+        ):
+            raise ReplayFailureError(
+                "match_limit must be between 1 and 100.",
+                {"match_limit": normalized_match_limit},
+            )
+        params: dict[str, Any] = {
+            "resource_id": self.context.normalize_required_string(resource_id, "resource_id"),
+            "cursor": normalized_cursor or 0,
+            "scan_limit": normalized_scan_limit or 100,
+            "match_limit": normalized_match_limit or 50,
+        }
+        if normalized_min is not None:
+            params["event_id_min"] = normalized_min
+        if normalized_max is not None:
+            params["event_id_max"] = normalized_max
+        session, result = self.context.capture_tool(capture_id, "search_resource_bindings", params)
+        return attach_capture(ensure_meta(result), session)
+
     def renderdoc_get_pixel_history(
         self,
-        capture_id: str,
-        texture_id: str,
-        x: int,
-        y: int,
-        mip_level: int | None = 0,
-        array_slice: int | None = 0,
-        sample: int | None = 0,
-        cursor: int | str | None = None,
-        limit: int | str | None = None,
+        capture_id: CaptureId,
+        texture_id: ResourceId,
+        x: NonNegativeInt,
+        y: NonNegativeInt,
+        mip_level: NonNegativeInt | None = 0,
+        array_slice: NonNegativeInt | None = 0,
+        sample: NonNegativeInt | None = 0,
+        cursor: Cursor | None = None,
+        limit: TimingPageLimit | None = None,
     ) -> dict[str, Any]:
         params = self._normalize_pixel_params(texture_id, x, y, mip_level, array_slice, sample)
         normalized_cursor = self.context.normalize_optional_int(cursor, "cursor")
@@ -149,13 +227,13 @@ class ResourceHandlers:
 
     def renderdoc_debug_pixel(
         self,
-        capture_id: str,
-        texture_id: str,
-        x: int,
-        y: int,
-        mip_level: int | None = 0,
-        array_slice: int | None = 0,
-        sample: int | None = 0,
+        capture_id: CaptureId,
+        texture_id: ResourceId,
+        x: NonNegativeInt,
+        y: NonNegativeInt,
+        mip_level: NonNegativeInt | None = 0,
+        array_slice: NonNegativeInt | None = 0,
+        sample: NonNegativeInt | None = 0,
     ) -> dict[str, Any]:
         params = self._normalize_pixel_params(texture_id, x, y, mip_level, array_slice, sample)
         session, result = self.context.capture_tool(capture_id, "debug_pixel", params)
@@ -163,13 +241,13 @@ class ResourceHandlers:
 
     def renderdoc_trace_bad_pixel(
         self,
-        capture_id: str,
-        texture_id: str,
-        x: int,
-        y: int,
-        mip_level: int | None = 0,
-        array_slice: int | None = 0,
-        sample: int | None = 0,
+        capture_id: CaptureId,
+        texture_id: ResourceId,
+        x: NonNegativeInt,
+        y: NonNegativeInt,
+        mip_level: NonNegativeInt | None = 0,
+        array_slice: NonNegativeInt | None = 0,
+        sample: NonNegativeInt | None = 0,
     ) -> dict[str, Any]:
         params = self._normalize_pixel_params(texture_id, x, y, mip_level, array_slice, sample)
         session, result = self.context.capture_tool(capture_id, "trace_bad_pixel", params)
@@ -177,20 +255,20 @@ class ResourceHandlers:
 
     def renderdoc_probe_texture_regions(
         self,
-        capture_id: str,
-        texture_id: str,
-        x: int | str | None = 0,
-        y: int | str | None = 0,
-        width: int | str | None = None,
-        height: int | str | None = None,
-        mip_level: int | str | None = 0,
-        array_slice: int | str | None = 0,
-        sample: int | str | None = 0,
-        channel_mode: str | None = "luma",
-        threshold: float | str | None = None,
-        min_region_pixels: int | str | None = None,
-        max_regions: int | str | None = None,
-        max_candidate_pixels_per_region: int | str | None = None,
+        capture_id: CaptureId,
+        texture_id: ResourceId,
+        x: NonNegativeInt | None = 0,
+        y: NonNegativeInt | None = 0,
+        width: TextureProbeDimension | None = None,
+        height: TextureProbeDimension | None = None,
+        mip_level: NonNegativeInt | None = 0,
+        array_slice: NonNegativeInt | None = 0,
+        sample: NonNegativeInt | None = 0,
+        channel_mode: TextureProbeChannel | None = "luma",
+        threshold: TextureProbeThreshold | None = None,
+        min_region_pixels: TextureProbeRegionPixels | None = None,
+        max_regions: TextureProbeRegionLimit | None = None,
+        max_candidate_pixels_per_region: TextureProbeCandidateLimit | None = None,
     ) -> dict[str, Any]:
         normalized_channel_mode = (self.context.normalize_optional_string(channel_mode) or "luma").lower()
         normalized_threshold = self.context.normalize_optional_float(threshold, "threshold")
@@ -205,8 +283,8 @@ class ResourceHandlers:
 
         if normalized_channel_mode not in SUPPORTED_TEXTURE_PROBE_CHANNEL_MODES:
             raise ReplayFailureError(
-                "channel_mode must be one of alpha, any, luma, or max_rgb.",
-                {"channel_mode": normalized_channel_mode},
+                "channel_mode must be one of alpha, any, gradient, local_outlier, luma, max_rgb, or nan_inf.",
+                {"channel_mode": normalized_channel_mode, "supported_values": sorted(SUPPORTED_TEXTURE_PROBE_CHANNEL_MODES)},
             )
         if normalized_threshold is not None and (normalized_threshold < 0.0 or normalized_threshold > 1.0):
             raise ReplayFailureError(
@@ -277,15 +355,15 @@ class ResourceHandlers:
 
     def renderdoc_start_pixel_shader_debug(
         self,
-        capture_id: str,
-        event_id: int,
-        x: int,
-        y: int,
+        capture_id: CaptureId,
+        event_id: EventId,
+        x: NonNegativeInt,
+        y: NonNegativeInt,
         texture_id: str | None = None,
-        sample: int | str | None = None,
-        primitive_id: int | str | None = None,
-        view: int | str | None = None,
-        state_limit: int | str | None = None,
+        sample: NonNegativeInt | None = None,
+        primitive_id: NonNegativeInt | None = None,
+        view: NonNegativeInt | None = None,
+        state_limit: ShaderDebugStateLimit | None = None,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {
             "event_id": self.context.normalize_required_int(event_id, "event_id"),
@@ -312,15 +390,15 @@ class ResourceHandlers:
 
     def renderdoc_start_compute_shader_debug(
         self,
-        capture_id: str,
-        event_id: int,
-        group_x: int,
-        group_y: int,
-        group_z: int = 0,
-        thread_x: int = 0,
-        thread_y: int = 0,
-        thread_z: int = 0,
-        state_limit: int | str | None = None,
+        capture_id: CaptureId,
+        event_id: EventId,
+        group_x: NonNegativeInt,
+        group_y: NonNegativeInt,
+        group_z: NonNegativeInt = 0,
+        thread_x: NonNegativeInt = 0,
+        thread_y: NonNegativeInt = 0,
+        thread_z: NonNegativeInt = 0,
+        state_limit: ShaderDebugStateLimit | None = None,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {
             "event_id": self.context.normalize_required_int(event_id, "event_id"),
@@ -342,9 +420,9 @@ class ResourceHandlers:
 
     def renderdoc_continue_shader_debug(
         self,
-        capture_id: str,
-        shader_debug_id: str,
-        state_limit: int | str | None = None,
+        capture_id: CaptureId,
+        shader_debug_id: ShaderDebugId,
+        state_limit: ShaderDebugStateLimit | None = None,
     ) -> dict[str, Any]:
         params = {
             "shader_debug_id": self.context.normalize_required_string(shader_debug_id, "shader_debug_id"),
@@ -353,12 +431,38 @@ class ResourceHandlers:
         session, result = self.context.capture_tool(capture_id, "continue_shader_debug", params)
         return attach_capture(ensure_meta(result), session)
 
+    def renderdoc_analyze_shader_debug(
+        self,
+        capture_id: CaptureId,
+        shader_debug_id: ShaderDebugId,
+        max_steps: ShaderDebugAnalysisLimit | None = None,
+        max_interesting_steps: ShaderDebugInterestingLimit | None = None,
+    ) -> dict[str, Any]:
+        normalized_max_steps = self.context.normalize_optional_int(max_steps, "max_steps") or 4096
+        normalized_interesting = (
+            self.context.normalize_optional_int(max_interesting_steps, "max_interesting_steps") or 32
+        )
+        if normalized_max_steps <= 0 or normalized_max_steps > 8192:
+            raise ReplayFailureError("max_steps must be between 1 and 8192.", {"max_steps": normalized_max_steps})
+        if normalized_interesting <= 0 or normalized_interesting > 128:
+            raise ReplayFailureError(
+                "max_interesting_steps must be between 1 and 128.",
+                {"max_interesting_steps": normalized_interesting},
+            )
+        params = {
+            "shader_debug_id": self.context.normalize_required_string(shader_debug_id, "shader_debug_id"),
+            "max_steps": normalized_max_steps,
+            "max_interesting_steps": normalized_interesting,
+        }
+        session, result = self.context.capture_tool(capture_id, "analyze_shader_debug", params)
+        return attach_capture(ensure_meta(result), session)
+
     def renderdoc_get_shader_debug_step(
         self,
-        capture_id: str,
-        shader_debug_id: str,
-        step_index: int,
-        change_limit: int | str | None = None,
+        capture_id: CaptureId,
+        shader_debug_id: ShaderDebugId,
+        step_index: NonNegativeInt,
+        change_limit: ShaderDebugChangeLimit | None = None,
     ) -> dict[str, Any]:
         params = {
             "shader_debug_id": self.context.normalize_required_string(shader_debug_id, "shader_debug_id"),
@@ -368,22 +472,22 @@ class ResourceHandlers:
         session, result = self.context.capture_tool(capture_id, "get_shader_debug_step", params)
         return attach_capture(ensure_meta(result), session)
 
-    def renderdoc_end_shader_debug(self, capture_id: str, shader_debug_id: str) -> dict[str, Any]:
+    def renderdoc_end_shader_debug(self, capture_id: CaptureId, shader_debug_id: ShaderDebugId) -> dict[str, Any]:
         params = {"shader_debug_id": self.context.normalize_required_string(shader_debug_id, "shader_debug_id")}
         session, result = self.context.capture_tool(capture_id, "end_shader_debug", params)
         return attach_capture(ensure_meta(result), session)
 
     def renderdoc_get_texture_data(
         self,
-        capture_id: str,
-        texture_id: str,
-        mip_level: int,
-        x: int,
-        y: int,
-        width: int,
-        height: int,
-        array_slice: int = 0,
-        sample: int = 0,
+        capture_id: CaptureId,
+        texture_id: ResourceId,
+        mip_level: NonNegativeInt,
+        x: NonNegativeInt,
+        y: NonNegativeInt,
+        width: TexturePreviewDimension,
+        height: TexturePreviewDimension,
+        array_slice: NonNegativeInt = 0,
+        sample: NonNegativeInt = 0,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {
             "texture_id": self.context.normalize_required_string(texture_id, "texture_id"),
@@ -417,11 +521,11 @@ class ResourceHandlers:
 
     def renderdoc_get_buffer_data(
         self,
-        capture_id: str,
-        buffer_id: str,
-        offset: int | str | None = 0,
-        size: int | str | None = None,
-        encoding: str | None = None,
+        capture_id: CaptureId,
+        buffer_id: ResourceId,
+        offset: NonNegativeInt | None = 0,
+        size: BufferReadSize | None = None,
+        encoding: BufferEncoding | None = None,
     ) -> dict[str, Any]:
         normalized_size = self.context.normalize_optional_int(size, "size")
         normalized_encoding = (self.context.normalize_optional_string(encoding) or "hex").lower()
@@ -453,11 +557,11 @@ class ResourceHandlers:
 
     def renderdoc_save_texture_to_file(
         self,
-        capture_id: str,
-        texture_id: str,
+        capture_id: CaptureId,
+        texture_id: ResourceId,
         output_path: str,
-        mip_level: int = 0,
-        array_slice: int = 0,
+        mip_level: NonNegativeInt = 0,
+        array_slice: NonNegativeInt = 0,
     ) -> dict[str, Any]:
         normalized_output_path = self.context.normalize_required_string(output_path, "output_path")
         params = {

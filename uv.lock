@@ -892,6 +892,7 @@ name = "renderdoc-mcp"
 source = { editable = "." }
 dependencies = [
     { name = "mcp" },
+    { name = "pydantic" },
 ]
 
 [package.dev-dependencies]
@@ -903,7 +904,10 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "mcp", specifier = ">=1.26.0,<2.0.0" }]
+requires-dist = [
+    { name = "mcp", specifier = ">=1.26.0,<2.0.0" },
+    { name = "pydantic", specifier = ">=2.7.0,<3.0.0" },
+]
 
 [package.metadata.requires-dev]
 dev = [

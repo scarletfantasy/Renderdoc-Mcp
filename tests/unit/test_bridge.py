@@ -372,6 +372,65 @@ def test_bridge_client_pipeline_bindings_degrades_when_accessor_signature_change
     assert "compatible D3D12 pipeline accessor" in response["items"][0]["reason"]
 
 
+def test_bridge_client_flattens_semantic_shader_bindings_with_stage_context() -> None:
+    client = BridgeClient(FakeContext(FakeController()))
+    pipeline = {
+        "shaders": [
+            {
+                "stage": "Pixel",
+                "shader_id": "shader-1",
+                "shader_name": "MainPS",
+                "read_only_resources": [
+                    {"access": {"index": 3}, "descriptor": {"resource_id": "tex-1", "resource_name": "SceneColor"}}
+                ],
+            }
+        ]
+    }
+
+    items = client._pipeline_binding_items(pipeline, {}, "read_only_resources")
+
+    assert items[0]["stage"] == "Pixel"
+    assert items[0]["shader_name"] == "MainPS"
+    assert items[0]["descriptor"]["resource_id"] == "tex-1"
+
+
+def test_resource_binding_search_reports_actual_and_bounded_return_counts(monkeypatch) -> None:
+    client = BridgeClient(FakeContext(FakeController()))
+    analysis = {"action_index": {event_id: {"flags": ["draw"]} for event_id in range(7, 12)}}
+    bindings = [
+        {
+            "stage": "Pixel",
+            "access": {"type": "ReadOnlyResource", "index": index},
+            "descriptor": {"resource_id": "tex-1"},
+        }
+        for index in range(40)
+    ]
+    monkeypatch.setattr(client, "_resource_usage_target", lambda resource_id: ("texture", {"resourceId": resource_id}))
+    monkeypatch.setattr(client, "_ensure_frame_analysis", lambda: analysis)
+    monkeypatch.setattr(client, "_get_pipeline_state", lambda event_id: {"pipeline": {}})
+    monkeypatch.setattr(
+        client,
+        "_pipeline_binding_items",
+        lambda pipeline, api_details, kind: bindings if kind == "read_only_resources" else [],
+    )
+    monkeypatch.setattr(client, "_compact_texture", lambda resource: {"resource_id": "tex-1"})
+    monkeypatch.setattr(
+        bridge_client_module.frame_analysis,
+        "build_action_summary_result",
+        lambda frame, event_id: {"action": {"event_id": event_id}},
+    )
+
+    result = client._search_resource_bindings("tex-1", None, None, None, 100, 100)
+
+    assert result["matched_event_count"] == 5
+    assert result["matched_binding_count"] == 200
+    assert result["returned_event_count"] == 4
+    assert result["returned_binding_count"] == 128
+    assert result["matches"][0]["binding_count"] == 40
+    assert result["matches"][0]["bindings_truncated"] is True
+    assert result["meta"]["scan"]["matches_truncated"] is True
+
+
 def test_bridge_client_texture_recommendations_include_probe_tool() -> None:
     client = BridgeClient(FakeContext(FakeController()))
 
@@ -440,6 +499,76 @@ def test_bridge_client_probe_texture_regions_detects_single_active_block(monkeyp
         "width": 7,
         "height": 8,
     }
+
+
+def test_probe_activity_grid_supports_non_finite_outlier_and_gradient_modes() -> None:
+    pixels = [
+        [[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0], [float("nan"), 0.0, 0.0, 1.0]],
+        [[0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0], [0.0, 0.0, 0.0, 1.0]],
+    ]
+
+    non_finite = bridge_client_module._probe_activity_grid(pixels, "nan_inf")
+    outlier = bridge_client_module._probe_activity_grid(pixels, "local_outlier")
+    gradient = bridge_client_module._probe_activity_grid(pixels, "gradient")
+
+    assert non_finite[0][2] == 1.0
+    assert non_finite[1][1] == 0.0
+    assert outlier[1][1] > 0.5
+    assert gradient[0][0] == 1.0
+
+
+def test_probe_outlier_mode_preserves_negative_signal_and_defaults_to_64_square() -> None:
+    pixels = [
+        [[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0]],
+        [[0.0, 0.0, 0.0, 1.0], [-1.0, -1.0, -1.0, 1.0], [0.0, 0.0, 0.0, 1.0]],
+        [[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0]],
+    ]
+    client = BridgeClient(FakeContext(FakeController()))
+
+    outlier = bridge_client_module._probe_activity_grid(pixels, "local_outlier")
+
+    assert outlier[1][1] == pytest.approx(1.0)
+    assert client._resolve_probe_dimensions(512, 512, 0, 0, None, None) == (64, 64)
+
+
+def test_event_dossier_enforces_a_global_binding_budget(monkeypatch) -> None:
+    client = BridgeClient(FakeContext(FakeController()))
+    monkeypatch.setattr(client, "_ensure_frame_analysis", lambda: {})
+    monkeypatch.setattr(
+        bridge_client_module.frame_analysis,
+        "build_action_summary_result",
+        lambda analysis, event_id: {"action": {"event_id": event_id}},
+    )
+    monkeypatch.setattr(bridge_client_module.frame_analysis, "get_innermost_pass_for_event", lambda analysis, event_id: None)
+    monkeypatch.setattr(client, "_get_pipeline_state", lambda event_id: {"pipeline": {"available": True}})
+    monkeypatch.setattr(client, "_get_api_pipeline_state", lambda event_id: {})
+    monkeypatch.setattr(
+        client,
+        "_pipeline_overview_from_payload",
+        lambda event_id, pipeline, api_pipeline: {"api": "D3D12", "pipeline": {}},
+    )
+    monkeypatch.setattr(client, "_pipeline_binding_items", lambda pipeline, api_pipeline, kind: [{"index": i} for i in range(100)])
+
+    result = client._get_event_dossier(
+        7,
+        ["read_only_resources", "read_write_resources", "constant_blocks"],
+        100,
+    )
+
+    assert result["meta"]["returned_binding_count"] == 128
+    assert [item["returned_count"] for item in result["bindings"].values()] == [100, 28, 0]
+    assert result["meta"]["bindings_truncated"] is True
+
+
+def test_event_dossier_batch_returns_unprocessed_ids_when_response_budget_is_reached(monkeypatch) -> None:
+    client = BridgeClient(FakeContext(FakeController()))
+    monkeypatch.setattr(client, "_get_event_dossier", lambda event_id, kinds, limit: {"text": "x" * 100_000})
+
+    result = client._get_event_dossiers([1, 2, 3], ["shaders"], 20)
+
+    assert result["processed_count"] == 1
+    assert result["unprocessed_event_ids"] == [2, 3]
+    assert result["meta"]["response_truncated"] is True
 
 
 def test_bridge_client_pixel_modification_preserves_unknown_pixel_value_payloads() -> None:
@@ -571,6 +700,61 @@ def test_bridge_client_shader_code_chunk_pages_cached_disassembly(monkeypatch) -
     assert response["returned_line_count"] == 2
     assert response["has_more"] is False
     assert response["text"] == "line2\nline3"
+
+
+def test_bridge_client_searches_complete_cached_shader_disassembly(monkeypatch) -> None:
+    client = BridgeClient(FakeContext(FakeController(state=FakeState(shader_bound=True))))
+    monkeypatch.setattr(
+        client,
+        "_get_shader_code",
+        lambda event_id, stage_name, target: {
+            "event_id": event_id,
+            "api": "D3D12",
+            "action": {"event_id": event_id},
+            "shader": {"stage": "Pixel", "shader_id": "shader-1", "shader_name": "MainPS"},
+            "disassembly": {
+                "available": True,
+                "reason": "",
+                "target": "dxil",
+                "available_targets": ["dxil"],
+                "text": "load r0\nadd r1, r0\nstore r1\nadd r2, r1",
+            },
+        },
+    )
+
+    response = client._search_shader_code(7, "Pixel", None, r"add r[12]", True, False, 1, 0, 25)
+
+    assert response["total_match_count"] == 2
+    assert [item["line_number"] for item in response["matches"]] == [2, 4]
+    assert "load r0" in response["matches"][0]["context_text"]
+
+
+def test_shader_search_response_budget_preserves_a_resumable_cursor(monkeypatch) -> None:
+    client = BridgeClient(FakeContext(FakeController(state=FakeState(shader_bound=True))))
+    monkeypatch.setattr(bridge_client_module, "MAX_SHADER_SEARCH_RESPONSE_BYTES", 500)
+    monkeypatch.setattr(
+        client,
+        "_get_shader_code",
+        lambda event_id, stage_name, target: {
+            "event_id": event_id,
+            "api": "D3D12",
+            "action": {"event_id": event_id},
+            "shader": {"stage": "Pixel", "shader_id": "shader-1", "shader_name": "MainPS"},
+            "disassembly": {
+                "available": True,
+                "reason": "",
+                "target": "dxil",
+                "available_targets": ["dxil"],
+                "text": "\n".join("match " + ("x" * 300) for _ in range(4)),
+            },
+        },
+    )
+
+    response = client._search_shader_code(7, "Pixel", None, "match", False, False, 0, 0, 25)
+
+    assert len(response["matches"]) == 1
+    assert response["meta"]["page"]["next_cursor"] == "1"
+    assert response["meta"]["response_truncated"] is True
 
 
 def test_bridge_client_detects_shader_debugging_support() -> None:
@@ -866,6 +1050,12 @@ def test_bridge_client_pixel_shader_debug_sessions_buffer_continue_states(monkey
     assert step["changes"][0]["name"] == "color"
     assert step["changes"][0]["before_value"] == [0.0, 0.0, 0.0, 1.0]
     assert step["changes"][0]["after_value"] == [1.0, 0.0, 0.0, 1.0]
+
+    analysis = client._analyze_shader_debug(started["shader_debug_id"], 4096, 32)
+    assert analysis["analysis"]["analyzed_state_count"] == 3
+    assert analysis["analysis"]["changed_variables"][0] == {"name": "color", "change_step_count": 1}
+    assert analysis["analysis"]["flag_counts"]["SampleLoadGather"] == 1
+    assert analysis["meta"]["completed"] is True
 
     closed = client._end_shader_debug(started["shader_debug_id"])
     assert closed["closed"] is True

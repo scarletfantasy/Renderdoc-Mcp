@@ -18,6 +18,14 @@ class ResourceOps(BridgeComponent):
                 params.get("cursor"),
                 params.get("limit"),
             ),
+            "search_resource_bindings": lambda params: self._search_resource_bindings(
+                params.get("resource_id", ""),
+                params.get("event_id_min"),
+                params.get("event_id_max"),
+                params.get("cursor"),
+                params.get("scan_limit", 100),
+                params.get("match_limit", 50),
+            ),
             "get_pixel_history": lambda params: self._get_pixel_history(
                 params.get("texture_id", ""),
                 int(params.get("x", 0)),
@@ -142,3 +150,14 @@ class ResourceOps(BridgeComponent):
 
     def _list_resource_usages(self, resource_id, usage_kind, cursor, limit):
         return self._call_bridge_client("_list_resource_usages", resource_id, usage_kind, cursor, limit)
+
+    def _search_resource_bindings(self, resource_id, event_id_min, event_id_max, cursor, scan_limit, match_limit):
+        return self._call_bridge_client(
+            "_search_resource_bindings",
+            resource_id,
+            event_id_min,
+            event_id_max,
+            cursor,
+            scan_limit,
+            match_limit,
+        )

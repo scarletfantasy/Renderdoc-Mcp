@@ -1,7 +1,9 @@
 import base64
 from collections import OrderedDict, deque
 import json
+import math
 import os
+import re
 import threading
 import time
 import traceback
@@ -57,10 +59,15 @@ from .transport import _log
 PROTOCOL_VERSION = 1
 CONNECT_RETRY_SECONDS = 20.0
 PROBE_DEFAULT_THRESHOLD = 0.05
+PROBE_DEFAULT_DIMENSION = 64
 PROBE_MAX_DIMENSION = 128
 PROBE_MAX_PIXELS = 16384
-PROBE_SUPPORTED_CHANNEL_MODES = {"luma", "max_rgb", "alpha", "any"}
+PROBE_SUPPORTED_CHANNEL_MODES = {"luma", "max_rgb", "alpha", "any", "nan_inf", "local_outlier", "gradient"}
 MAX_SHADER_CODE_CACHE_ENTRIES = 64
+MAX_DOSSIER_BINDING_ITEMS = 128
+MAX_DOSSIER_BATCH_RESPONSE_BYTES = 192 * 1024
+MAX_RESOURCE_BINDING_RESPONSE_ITEMS = 128
+MAX_SHADER_SEARCH_RESPONSE_BYTES = 160 * 1024
 
 _bridge = None
 _METHOD_UNAVAILABLE = object()
@@ -256,10 +263,10 @@ def _probe_pixel_activity(pixel, channel_mode):
     values = list(pixel or [])
     while len(values) < 4:
         values.append(0.0)
-    r = max(0.0, _safe_float(values[0]))
-    g = max(0.0, _safe_float(values[1]))
-    b = max(0.0, _safe_float(values[2]))
-    a = max(0.0, _safe_float(values[3]))
+    raw = [_safe_float(value) for value in values[:4]]
+    if channel_mode == "nan_inf":
+        return 1.0 if any(not math.isfinite(value) for value in raw) else 0.0
+    r, g, b, a = [max(0.0, value) if math.isfinite(value) else 0.0 for value in raw]
 
     if channel_mode == "alpha":
         return a
@@ -268,6 +275,44 @@ def _probe_pixel_activity(pixel, channel_mode):
     if channel_mode == "any":
         return max(r, g, b, a)
     return (0.2126 * r) + (0.7152 * g) + (0.0722 * b)
+
+
+def _probe_signed_luma(pixel):
+    values = list(pixel or [])
+    while len(values) < 3:
+        values.append(0.0)
+    r, g, b = [_safe_float(value) for value in values[:3]]
+    r, g, b = [value if math.isfinite(value) else 0.0 for value in (r, g, b)]
+    return (0.2126 * r) + (0.7152 * g) + (0.0722 * b)
+
+
+def _probe_activity_grid(pixels, channel_mode):
+    if channel_mode in ("local_outlier", "gradient"):
+        base = [[_probe_signed_luma(pixel) for pixel in row] for row in pixels]
+    else:
+        base = [[_probe_pixel_activity(pixel, channel_mode) for pixel in row] for row in pixels]
+    if channel_mode not in ("local_outlier", "gradient"):
+        return base
+
+    height = len(base)
+    width = len(base[0]) if base else 0
+    output = [[0.0 for _ in range(width)] for _ in range(height)]
+    for row in range(height):
+        for column in range(width):
+            neighbors = []
+            for neighbor_y in range(max(0, row - 1), min(height, row + 2)):
+                for neighbor_x in range(max(0, column - 1), min(width, column + 2)):
+                    if neighbor_x == column and neighbor_y == row:
+                        continue
+                    neighbors.append(base[neighbor_y][neighbor_x])
+            if not neighbors:
+                continue
+            current = base[row][column]
+            if channel_mode == "local_outlier":
+                output[row][column] = abs(current - (sum(neighbors) / float(len(neighbors))))
+            else:
+                output[row][column] = max(abs(current - value) for value in neighbors)
+    return output
 
 
 def _probe_point_payload(point):
@@ -882,6 +927,7 @@ class BridgeClient(object):
         if item["kind"] == "texture":
             return [
                 {"tool": "renderdoc_list_resource_usages", "arguments": {"resource_id": item["resource_id"]}},
+                {"tool": "renderdoc_search_resource_bindings", "arguments": {"resource_id": item["resource_id"]}},
                 {"tool": "renderdoc_get_texture_data", "arguments": {"texture_id": item["resource_id"]}},
                 {"tool": "renderdoc_probe_texture_regions", "arguments": {"texture_id": item["resource_id"]}},
                 {"tool": "renderdoc_get_pixel_history", "arguments": {"texture_id": item["resource_id"], "x": 0, "y": 0}},
@@ -889,6 +935,7 @@ class BridgeClient(object):
                 {"tool": "renderdoc_save_texture_to_file", "arguments": {"texture_id": item["resource_id"]}},
             ]
         return [
+            {"tool": "renderdoc_search_resource_bindings", "arguments": {"resource_id": item["resource_id"]}},
             {"tool": "renderdoc_get_buffer_data", "arguments": {"buffer_id": item["resource_id"], "offset": 0}},
         ]
 
@@ -1295,7 +1342,7 @@ class BridgeClient(object):
                         "label": entry["name"],
                         "reason": "High-impact event ranked by {}.".format(entry["metric_name"]),
                         "recommended_call": {
-                            "tool": "renderdoc_get_pipeline_overview",
+                            "tool": "renderdoc_get_event_dossier",
                             "arguments": {"event_id": int(entry["event_id"])},
                         },
                     }
@@ -1319,7 +1366,7 @@ class BridgeClient(object):
                         "recommended_call": {"tool": next_tool, "arguments": next_args},
                     }
                 )
-        else:
+        elif focus == "resources":
             for item in self._list_resource_items("all", None, "size")[:limit]:
                 items.append(
                     {
@@ -1330,6 +1377,42 @@ class BridgeClient(object):
                         "recommended_call": {
                             "tool": "renderdoc_get_resource_summary",
                             "arguments": {"resource_id": item["resource_id"]},
+                        },
+                    }
+                )
+        else:
+            candidates = []
+            for event_id in sorted(analysis.get("action_index", {}), reverse=True):
+                node = analysis["action_index"][event_id]
+                summary = frame_analysis.action_summary(node)
+                usage = summary.get("resource_usage_summary", {})
+                flags = set(summary.get("flags", []))
+                if not (
+                    int(usage.get("output_count", 0)) > 0
+                    or bool(usage.get("has_depth_output", False))
+                    or flags.intersection({"copy", "resolve", "clear"})
+                ):
+                    continue
+                candidates.append(summary)
+                if len(candidates) >= limit:
+                    break
+
+            for entry in candidates:
+                usage = entry.get("resource_usage_summary", {})
+                outputs = list(usage.get("output_resources", []))
+                if usage.get("depth_resource"):
+                    outputs.append(usage["depth_resource"])
+                items.append(
+                    {
+                        "kind": "event",
+                        "id": int(entry["event_id"]),
+                        "label": entry["name"],
+                        "reason": "Late-frame writer or copy candidate{}.".format(
+                            " touching {}".format(", ".join(outputs[:3])) if outputs else ""
+                        ),
+                        "recommended_call": {
+                            "tool": "renderdoc_get_event_dossier",
+                            "arguments": {"event_id": int(entry["event_id"])},
                         },
                     }
                 )
@@ -1362,6 +1445,27 @@ class BridgeClient(object):
             cursor=cursor,
             limit=limit,
         )
+
+    def _search_actions(self, parent_event_id, query, flags_filter, resource_id, event_id_min, event_id_max, cursor, limit):
+        analysis = self._ensure_frame_analysis()
+        result = frame_analysis.build_action_search_result(
+            analysis,
+            parent_event_id=parent_event_id,
+            query=query,
+            flags_filter=flags_filter,
+            resource_id=resource_id,
+            event_id_min=event_id_min,
+            event_id_max=event_id_max,
+            cursor=cursor,
+            limit=limit,
+        )
+        if result is None:
+            raise BridgeError(
+                "invalid_event_id",
+                "The supplied parent_event_id does not exist in the current capture.",
+                {"event_id": int(parent_event_id or 0)},
+            )
+        return result
 
     def _analyze_frame(self, include_timing_summary=False):
         analysis = self._ensure_frame_analysis()
@@ -1474,11 +1578,12 @@ class BridgeClient(object):
             )
         return summary
 
-    def _get_pipeline_overview(self, event_id):
-        pipeline_payload = self._get_pipeline_state(event_id)
-        api_pipeline_payload = self._get_api_pipeline_state(event_id)
+    def _pipeline_overview_from_payload(self, event_id, pipeline_payload, api_pipeline_payload):
         pipeline = pipeline_payload.get("pipeline", {})
         shaders = [self._compact_shader_binding(item) for item in pipeline.get("shaders", [])]
+        semantic_counts = {}
+        for binding_kind in ("read_only_resources", "read_write_resources", "samplers", "constant_blocks"):
+            semantic_counts[binding_kind] = len(self._pipeline_binding_items(pipeline, api_pipeline_payload, binding_kind))
         overview = {
             "event_id": int(event_id),
             "api": pipeline_payload.get("api", api_pipeline_payload.get("api", "")),
@@ -1495,6 +1600,10 @@ class BridgeClient(object):
                     "vertex_inputs": len(pipeline.get("vertex_inputs", [])),
                     "output_targets": len(self._get_output_target_items(pipeline)),
                     "shaders": len(shaders),
+                    "read_only_resources": semantic_counts["read_only_resources"],
+                    "read_write_resources": semantic_counts["read_write_resources"],
+                    "samplers": semantic_counts["samplers"],
+                    "constant_blocks": semantic_counts["constant_blocks"],
                 },
                 "shaders": shaders,
                 "api_details_available": bool((api_pipeline_payload.get("api_pipeline") or {}).get("available", False)),
@@ -1506,24 +1615,41 @@ class BridgeClient(object):
         }
         return overview
 
+    def _get_pipeline_overview(self, event_id):
+        pipeline_payload = self._get_pipeline_state(event_id)
+        api_pipeline_payload = self._get_api_pipeline_state(event_id)
+        return self._pipeline_overview_from_payload(event_id, pipeline_payload, api_pipeline_payload)
+
+    def _pipeline_binding_items(self, pipeline, api_pipeline_payload, binding_kind):
+        if binding_kind == "descriptor_accesses":
+            return list(pipeline.get("descriptor_accesses", []))
+        if binding_kind == "vertex_buffers":
+            return list(pipeline.get("vertex_buffers", []))
+        if binding_kind == "vertex_inputs":
+            return list(pipeline.get("vertex_inputs", []))
+        if binding_kind == "output_targets":
+            return self._get_output_target_items(pipeline)
+        if binding_kind == "shaders":
+            return [self._compact_shader_binding(item) for item in pipeline.get("shaders", [])]
+        if binding_kind in ("read_only_resources", "read_write_resources", "samplers", "constant_blocks"):
+            items = []
+            for shader in pipeline.get("shaders", []):
+                for binding in shader.get(binding_kind, []):
+                    entry = dict(binding)
+                    entry["stage"] = shader.get("stage", "")
+                    entry["shader_id"] = shader.get("shader_id", "")
+                    entry["shader_name"] = shader.get("shader_name", "")
+                    items.append(entry)
+            return items
+        api_details = api_pipeline_payload.get("api_pipeline")
+        return [api_details] if api_details is not None else []
+
     def _list_pipeline_bindings(self, event_id, binding_kind, cursor, limit):
         pipeline_payload = self._get_pipeline_state(event_id)
         api_pipeline_payload = self._get_api_pipeline_state(event_id)
         pipeline = pipeline_payload.get("pipeline", {})
 
-        if binding_kind == "descriptor_accesses":
-            items = list(pipeline.get("descriptor_accesses", []))
-        elif binding_kind == "vertex_buffers":
-            items = list(pipeline.get("vertex_buffers", []))
-        elif binding_kind == "vertex_inputs":
-            items = list(pipeline.get("vertex_inputs", []))
-        elif binding_kind == "output_targets":
-            items = self._get_output_target_items(pipeline)
-        elif binding_kind == "shaders":
-            items = [self._compact_shader_binding(item) for item in pipeline.get("shaders", [])]
-        else:
-            api_details = api_pipeline_payload.get("api_pipeline")
-            items = [api_details] if api_details is not None else []
+        items = self._pipeline_binding_items(pipeline, api_pipeline_payload, binding_kind)
 
         paging = self._page_items(items, cursor or 0, limit or 50)
         return {
@@ -1534,6 +1660,95 @@ class BridgeClient(object):
             "available": bool(pipeline.get("available", False)) if binding_kind != "api_details" else True,
             "items": paging["items"],
             "meta": {"page": paging["page"]},
+        }
+
+    def _get_event_dossier(self, event_id, binding_kinds, binding_limit):
+        analysis = self._ensure_frame_analysis()
+        action_result = frame_analysis.build_action_summary_result(analysis, event_id)
+        if action_result is None:
+            raise BridgeError(
+                "invalid_event_id",
+                "The supplied event_id does not exist in the current capture.",
+                {"event_id": int(event_id)},
+            )
+
+        pipeline_payload = self._get_pipeline_state(event_id)
+        api_pipeline_payload = self._get_api_pipeline_state(event_id)
+        overview = self._pipeline_overview_from_payload(event_id, pipeline_payload, api_pipeline_payload)
+        pipeline = pipeline_payload.get("pipeline", {})
+        bindings = {}
+        per_kind_limit = max(1, min(100, int(binding_limit or 20)))
+        remaining_binding_budget = MAX_DOSSIER_BINDING_ITEMS
+        returned_binding_count = 0
+        for binding_kind in list(binding_kinds or ["output_targets", "shaders"]):
+            items = self._pipeline_binding_items(pipeline, api_pipeline_payload, binding_kind)
+            returned_limit = min(per_kind_limit, remaining_binding_budget)
+            returned_items = items[:returned_limit]
+            returned_binding_count += len(returned_items)
+            remaining_binding_budget -= len(returned_items)
+            bindings[str(binding_kind)] = {
+                "items": returned_items,
+                "returned_count": len(returned_items),
+                "total_count": len(items),
+                "truncated": len(items) > len(returned_items),
+            }
+
+        pass_payload = frame_analysis.get_innermost_pass_for_event(analysis, event_id)
+        return {
+            "event_id": int(event_id),
+            "api": overview.get("api", ""),
+            "action": action_result["action"],
+            "pass": frame_analysis.pass_summary(pass_payload) if pass_payload is not None else None,
+            "pipeline": overview["pipeline"],
+            "bindings": bindings,
+            "meta": {
+                "binding_kinds": list(bindings),
+                "binding_limit": per_kind_limit,
+                "response_binding_budget": MAX_DOSSIER_BINDING_ITEMS,
+                "returned_binding_count": returned_binding_count,
+                "bindings_truncated": any(value["truncated"] for value in bindings.values()),
+            },
+        }
+
+    def _get_event_dossiers(self, event_ids, binding_kinds, binding_limit):
+        requested_ids = list(event_ids or [])
+        items = []
+        error_count = 0
+        response_bytes = 0
+        response_truncated = False
+        processed_count = 0
+        for event_index, event_id in enumerate(requested_ids):
+            try:
+                item = {
+                    "event_id": int(event_id),
+                    "ok": True,
+                    "dossier": self._get_event_dossier(int(event_id), binding_kinds, binding_limit),
+                }
+            except BridgeError as exc:
+                error_count += 1
+                item = {"event_id": int(event_id), "ok": False, "error": exc.to_payload()}
+            item_bytes = len(json.dumps(item, ensure_ascii=False, default=str).encode("utf-8"))
+            if items and response_bytes + item_bytes > MAX_DOSSIER_BATCH_RESPONSE_BYTES:
+                response_truncated = True
+                if not item.get("ok", False):
+                    error_count -= 1
+                break
+            items.append(item)
+            response_bytes += item_bytes
+            processed_count = event_index + 1
+        return {
+            "items": items,
+            "requested_count": len(requested_ids),
+            "success_count": len(items) - error_count,
+            "error_count": error_count,
+            "processed_count": processed_count,
+            "unprocessed_event_ids": [int(value) for value in requested_ids[processed_count:]],
+            "meta": {
+                "partial_failures": error_count > 0,
+                "response_bytes": response_bytes,
+                "response_budget_bytes": MAX_DOSSIER_BATCH_RESPONSE_BYTES,
+                "response_truncated": response_truncated,
+            },
         }
 
     def _get_shader_summary(self, event_id, stage_name):
@@ -1637,6 +1852,106 @@ class BridgeClient(object):
             "total_lines": total_lines,
             "has_more": (offset + returned_line_count) < total_lines,
             "text": "\n".join(chunk),
+        }
+
+    def _search_shader_code(self, event_id, stage_name, target, query, regex, case_sensitive, context_lines, cursor, limit):
+        first_chunk = self._get_shader_code_chunk(event_id, stage_name, target, 1, 1)
+        if not first_chunk.get("available", False):
+            return {
+                "event_id": int(event_id),
+                "shader": dict(first_chunk.get("shader", {})),
+                "target": first_chunk.get("target", ""),
+                "available": False,
+                "reason": first_chunk.get("reason", ""),
+                "query": str(query or ""),
+                "matches": [],
+                "total_match_count": 0,
+                "meta": {"page": self._page_items([], cursor or 0, limit or 25)["page"]},
+            }
+
+        selected_target = str(first_chunk.get("target", "") or "")
+        cache_key = (int(event_id), str(stage_name), selected_target.lower())
+        cached = self._shader_code_cache_get(cache_key)
+        if cached is None:
+            raise BridgeError(
+                "shader_disassembly_unavailable",
+                "Shader disassembly was generated but could not be read from the server cache.",
+                {"event_id": int(event_id), "stage": stage_name, "target": selected_target},
+            )
+
+        query_text = str(query or "")
+        flags = 0 if case_sensitive else re.IGNORECASE
+        matcher = None
+        if regex:
+            try:
+                matcher = re.compile(query_text, flags)
+            except Exception as exc:
+                raise BridgeError(
+                    "invalid_shader_search_pattern",
+                    "The supplied shader search regular expression is invalid.",
+                    {"query": query_text, "error": str(exc)},
+                )
+
+        source_lines = list(cached.get("lines", []))
+        matched_indexes = []
+        normalized_query = query_text if case_sensitive else query_text.lower()
+        for index, line in enumerate(source_lines):
+            line_text = str(line)
+            matched = bool(matcher.search(line_text)) if matcher is not None else normalized_query in (
+                line_text if case_sensitive else line_text.lower()
+            )
+            if matched:
+                matched_indexes.append(index)
+
+        offset = max(0, int(cursor or 0))
+        requested_limit = max(1, min(100, int(limit or 25)))
+        context = max(0, min(10, int(context_lines or 0)))
+        matches = []
+        response_bytes = 0
+        for index in matched_indexes[offset : offset + requested_limit]:
+            start = max(0, int(index) - context)
+            end = min(len(source_lines), int(index) + context + 1)
+            match = {
+                "line_number": int(index) + 1,
+                "line": str(source_lines[int(index)])[:1000],
+                "context_start_line": start + 1,
+                "context_end_line": end,
+                "context_text": "\n".join(str(value)[:1000] for value in source_lines[start:end]),
+            }
+            match_bytes = len(json.dumps(match, ensure_ascii=False, default=str).encode("utf-8"))
+            if matches and response_bytes + match_bytes > MAX_SHADER_SEARCH_RESPONSE_BYTES:
+                break
+            matches.append(match)
+            response_bytes += match_bytes
+        next_offset = offset + len(matches)
+        has_more = next_offset < len(matched_indexes)
+        page = {
+            "cursor": str(offset),
+            "next_cursor": str(next_offset) if has_more else "",
+            "limit": requested_limit,
+            "returned_count": len(matches),
+            "total_count": len(matched_indexes),
+            "matched_count": len(matched_indexes),
+            "has_more": has_more,
+        }
+        return {
+            "event_id": int(event_id),
+            "api": cached.get("api", ""),
+            "shader": dict(cached.get("shader", {})),
+            "target": selected_target,
+            "available": True,
+            "query": query_text,
+            "regex": bool(regex),
+            "case_sensitive": bool(case_sensitive),
+            "total_lines": len(source_lines),
+            "total_match_count": len(matched_indexes),
+            "matches": matches,
+            "meta": {
+                "page": page,
+                "response_bytes": response_bytes,
+                "response_budget_bytes": MAX_SHADER_SEARCH_RESPONSE_BYTES,
+                "response_truncated": has_more and len(matches) < requested_limit,
+            },
         }
 
     def _shader_code_cache_get(self, cache_key):
@@ -2310,6 +2625,106 @@ class BridgeClient(object):
         self._block_invoke_checked(callback)
         return response
 
+    def _analyze_shader_debug(self, shader_debug_id, max_steps, max_interesting_steps):
+        self._ensure_capture_loaded()
+        session = self._get_shader_debug_session(shader_debug_id)
+        maximum = max(1, min(8192, int(max_steps or 4096)))
+        interesting_limit = max(1, min(128, int(max_interesting_steps or 32)))
+
+        def callback(controller):
+            while len(session["history"]) < maximum and self._shader_debug_has_more(session):
+                remaining = maximum - len(session["history"])
+                self._fill_shader_debug_pending_states(controller, session, min(128, max(1, remaining)))
+                if session["pending_states"]:
+                    self._consume_shader_debug_state_page(session, min(128, max(1, remaining)))
+                elif session["completed"]:
+                    break
+
+        self._block_invoke_checked(callback)
+        states = list(session["history"][:maximum])
+        flag_counts = {}
+        changed_variable_counts = {}
+        ranked = []
+        first_instruction = None
+        last_instruction = None
+        total_change_count = 0
+
+        for state in states:
+            summary = self._serialize_shader_debug_state_summary(session["trace"], state)
+            instruction = int(summary.get("next_instruction", 0))
+            first_instruction = instruction if first_instruction is None else first_instruction
+            last_instruction = instruction
+            for flag in summary.get("flags", []):
+                flag_counts[str(flag)] = flag_counts.get(str(flag), 0) + 1
+
+            changed_names = []
+            for change in _safe_list(getattr(state, "changes", [])):
+                payload = _serialize_shader_change(change)
+                name = str(payload.get("name", "") or "")
+                if name:
+                    changed_variable_counts[name] = changed_variable_counts.get(name, 0) + 1
+                    if name not in changed_names:
+                        changed_names.append(name)
+            total_change_count += int(summary.get("change_count", 0))
+            reasons = []
+            score = 0
+            if summary.get("flags"):
+                reasons.append("state_flags")
+                score += 100 + len(summary["flags"])
+            if summary.get("has_callstack"):
+                reasons.append("callstack")
+                score += 30
+            if int(summary.get("change_count", 0)) > 0:
+                reasons.append("variable_changes")
+                score += min(25, int(summary["change_count"]))
+            if summary.get("source_variable_names"):
+                reasons.append("source_mapping")
+                score += 5
+            if reasons:
+                entry = dict(summary)
+                entry["reasons"] = reasons
+                entry["changed_variables"] = changed_names[:16]
+                ranked.append((score, int(summary.get("step_index", 0)), entry))
+
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        interesting = [item[2] for item in ranked[:interesting_limit]]
+        if not interesting and states:
+            boundary_states = [states[0]] if len(states) == 1 else [states[0], states[-1]]
+            interesting = [
+                self._serialize_shader_debug_state_summary(session["trace"], state)
+                for state in boundary_states
+            ]
+
+        changed_variables = [
+            {"name": name, "change_step_count": count}
+            for name, count in sorted(changed_variable_counts.items(), key=lambda item: (-item[1], item[0]))[:32]
+        ]
+        return {
+            "shader_debug_id": session["shader_debug_id"],
+            "event_id": session["event_id"],
+            "api": session["api"],
+            "action": dict(session["action"]),
+            "shader": dict(session["shader"]),
+            "target": dict(session["target"]),
+            "trace_summary": dict(session["trace_summary"]),
+            "analysis": {
+                "analyzed_state_count": len(states),
+                "fetched_state_count": len(session["history"]),
+                "first_instruction": first_instruction,
+                "last_instruction": last_instruction,
+                "total_change_count": total_change_count,
+                "flag_counts": flag_counts,
+                "changed_variables": changed_variables,
+                "interesting_steps": interesting,
+            },
+            "meta": {
+                "completed": bool(session["completed"]),
+                "has_more": self._shader_debug_has_more(session),
+                "truncated": self._shader_debug_has_more(session) or len(session["history"]) > maximum,
+                "max_steps": maximum,
+            },
+        }
+
     def _get_shader_debug_step(self, shader_debug_id, step_index, change_limit):
         self._ensure_capture_loaded()
         session = self._get_shader_debug_session(shader_debug_id)
@@ -2824,8 +3239,8 @@ class BridgeClient(object):
         }
 
     def _resolve_probe_dimensions(self, mip_width, mip_height, x, y, width, height):
-        resolved_width = int(width) if width is not None else min(max(1, int(mip_width) - int(x)), PROBE_MAX_DIMENSION)
-        resolved_height = int(height) if height is not None else min(max(1, int(mip_height) - int(y)), PROBE_MAX_DIMENSION)
+        resolved_width = int(width) if width is not None else min(max(1, int(mip_width) - int(x)), PROBE_DEFAULT_DIMENSION)
+        resolved_height = int(height) if height is not None else min(max(1, int(mip_height) - int(y)), PROBE_DEFAULT_DIMENSION)
 
         if resolved_width <= 0 or resolved_height <= 0:
             raise BridgeError(
@@ -2940,8 +3355,8 @@ class BridgeClient(object):
         if normalized_channel_mode not in PROBE_SUPPORTED_CHANNEL_MODES:
             raise BridgeError(
                 "invalid_probe_channel_mode",
-                "channel_mode must be one of alpha, any, luma, or max_rgb.",
-                {"channel_mode": str(channel_mode or "")},
+                "channel_mode must be one of alpha, any, gradient, local_outlier, luma, max_rgb, or nan_inf.",
+                {"channel_mode": str(channel_mode or ""), "supported_values": sorted(PROBE_SUPPORTED_CHANNEL_MODES)},
             )
 
         normalized_threshold = max(0.0, _safe_float(threshold if threshold is not None else PROBE_DEFAULT_THRESHOLD))
@@ -2957,10 +3372,7 @@ class BridgeClient(object):
         origin_y = int((payload.get("query") or {}).get("y", y))
         scanned_pixel_count = scanned_width * scanned_height
 
-        activity_grid = [
-            [_probe_pixel_activity(pixel, normalized_channel_mode) for pixel in row]
-            for row in pixels
-        ]
+        activity_grid = _probe_activity_grid(pixels, normalized_channel_mode)
         active_pixel_count = sum(
             1
             for row in activity_grid
@@ -3303,6 +3715,115 @@ class BridgeClient(object):
             cursor=cursor,
             limit=limit,
         )
+
+    def _search_resource_bindings(self, resource_id, event_id_min, event_id_max, cursor, scan_limit, match_limit):
+        resource_kind, resource = self._resource_usage_target(resource_id)
+        analysis = self._ensure_frame_analysis()
+        minimum = int(event_id_min) if event_id_min is not None else None
+        maximum = int(event_id_max) if event_id_max is not None else None
+        candidate_ids = []
+        for event_id in sorted(analysis.get("action_index", {})):
+            node = analysis["action_index"][event_id]
+            flags = set(node.get("flags", []))
+            if not flags.intersection({"draw", "dispatch"}):
+                continue
+            if minimum is not None and int(event_id) < minimum:
+                continue
+            if maximum is not None and int(event_id) > maximum:
+                continue
+            candidate_ids.append(int(event_id))
+
+        offset = max(0, int(cursor or 0))
+        bounded_scan_limit = max(1, min(500, int(scan_limit or 100)))
+        bounded_match_limit = max(1, min(100, int(match_limit or 50)))
+        scanned_ids = candidate_ids[offset : offset + bounded_scan_limit]
+        matches = []
+        matched_event_count = 0
+        total_binding_count = 0
+        returned_binding_count = 0
+        max_bindings_per_event = 32
+
+        for event_id in scanned_ids:
+            pipeline_payload = self._get_pipeline_state(event_id)
+            pipeline = pipeline_payload.get("pipeline", {})
+            event_bindings = []
+            event_binding_count = 0
+            for binding_kind in ("read_only_resources", "read_write_resources", "constant_blocks"):
+                for binding in self._pipeline_binding_items(pipeline, {}, binding_kind):
+                    descriptor = binding.get("descriptor") or {}
+                    ids = {
+                        str(descriptor.get("resource_id", "") or ""),
+                        str(descriptor.get("secondary_resource_id", "") or ""),
+                        str(descriptor.get("view_id", "") or ""),
+                    }
+                    if str(resource_id) not in ids:
+                        continue
+                    event_binding_count += 1
+                    if len(event_bindings) >= max_bindings_per_event:
+                        continue
+                    access = binding.get("access") or {}
+                    event_bindings.append(
+                        {
+                            "binding_kind": binding_kind,
+                            "stage": binding.get("stage", access.get("stage", "")),
+                            "shader_id": binding.get("shader_id", ""),
+                            "shader_name": binding.get("shader_name", ""),
+                            "access_type": access.get("type", ""),
+                            "access_index": access.get("index"),
+                            "array_element": access.get("array_element"),
+                            "descriptor": descriptor,
+                        }
+                    )
+            if not event_binding_count:
+                continue
+            matched_event_count += 1
+            total_binding_count += event_binding_count
+            if len(matches) < bounded_match_limit and returned_binding_count < MAX_RESOURCE_BINDING_RESPONSE_ITEMS:
+                action = frame_analysis.build_action_summary_result(analysis, event_id)
+                remaining_response_items = MAX_RESOURCE_BINDING_RESPONSE_ITEMS - returned_binding_count
+                returned_event_bindings = event_bindings[:remaining_response_items]
+                returned_binding_count += len(returned_event_bindings)
+                matches.append(
+                    {
+                        "event_id": int(event_id),
+                        "action": action["action"] if action is not None else None,
+                        "bindings": returned_event_bindings,
+                        "binding_count": event_binding_count,
+                        "bindings_truncated": event_binding_count > len(returned_event_bindings),
+                    }
+                )
+
+        next_offset = offset + len(scanned_ids)
+        has_more = next_offset < len(candidate_ids)
+        compact_resource = self._compact_texture(resource) if resource_kind == "texture" else self._compact_buffer(resource)
+        return {
+            "resource": compact_resource,
+            "matches": matches,
+            "matched_event_count": matched_event_count,
+            "matched_binding_count": total_binding_count,
+            "returned_event_count": len(matches),
+            "returned_binding_count": returned_binding_count,
+            "coverage": {
+                "binding_kinds": ["read_only_resources", "read_write_resources", "constant_blocks"],
+                "apis": "pipeline_state_abstraction",
+                "known_write_index_separate": resource_kind == "texture",
+            },
+            "meta": {
+                "scan": {
+                    "cursor": str(offset),
+                    "next_cursor": str(next_offset) if has_more else "",
+                    "scan_limit": bounded_scan_limit,
+                    "scanned_count": len(scanned_ids),
+                    "candidate_count": len(candidate_ids),
+                    "has_more": has_more,
+                    "matches_truncated": (
+                        matched_event_count > len(matches) or total_binding_count > returned_binding_count
+                    ),
+                    "max_bindings_per_event": max_bindings_per_event,
+                    "response_binding_budget": MAX_RESOURCE_BINDING_RESPONSE_ITEMS,
+                }
+            },
+        }
 
     def _close_capture(self):
         if self.ctx.IsCaptureLoaded():

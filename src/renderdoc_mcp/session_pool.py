@@ -46,6 +46,11 @@ class CaptureSession:
     bridge: RenderDocBridge
     last_used_monotonic: float
     in_use_count: int = 0
+    open_count: int = 1
+
+
+def _capture_path_key(capture_path: str) -> str:
+    return os.path.normcase(os.path.abspath(capture_path))
 
 
 def _close_session_snapshot(sessions: list[CaptureSession]) -> None:
@@ -58,6 +63,7 @@ def _close_session_snapshot(sessions: list[CaptureSession]) -> None:
 
 def _finalize_session_pool(
     sessions: dict[str, CaptureSession],
+    path_index: dict[str, str],
     lock: threading.RLock,
     janitor_stop: threading.Event,
 ) -> None:
@@ -65,6 +71,7 @@ def _finalize_session_pool(
     with lock:
         snapshot = list(sessions.values())
         sessions.clear()
+        path_index.clear()
     _close_session_snapshot(snapshot)
 
 
@@ -103,6 +110,7 @@ class CaptureSessionPool:
         self._monotonic = monotonic or time.monotonic
         self._lock = threading.RLock()
         self._sessions: dict[str, CaptureSession] = {}
+        self._path_index: dict[str, str] = {}
         self._enable_janitor = bool(enable_janitor and self.idle_timeout_seconds > 0)
         self._janitor_stop = threading.Event()
         self._janitor_thread: threading.Thread | None = None
@@ -110,50 +118,63 @@ class CaptureSessionPool:
             self,
             _finalize_session_pool,
             self._sessions,
+            self._path_index,
             self._lock,
             self._janitor_stop,
         )
 
     def open(self, capture_path: str) -> CaptureSession:
+        session, _ = self._open(capture_path, initial_in_use_count=0)
+        return session
+
+    def open_with_status(self, capture_path: str) -> tuple[CaptureSession, bool]:
         return self._open(capture_path, initial_in_use_count=0)
 
     @contextmanager
     def open_lease(self, capture_path: str) -> Iterator[CaptureSession]:
-        session = self._open(capture_path, initial_in_use_count=1)
-        try:
+        with self.open_lease_with_status(capture_path) as (session, _):
             yield session
+
+    @contextmanager
+    def open_lease_with_status(self, capture_path: str) -> Iterator[tuple[CaptureSession, bool]]:
+        session, reused = self._open(capture_path, initial_in_use_count=1)
+        try:
+            yield session, reused
         finally:
             self.release(session.capture_id)
 
-    def _open(self, capture_path: str, initial_in_use_count: int) -> CaptureSession:
-        bridge = self._bridge_factory()
+    def _open(self, capture_path: str, initial_in_use_count: int) -> tuple[CaptureSession, bool]:
         now = self._monotonic()
         to_close: list[CaptureSession] = []
-        added = False
         try:
             with self._lock:
                 to_close.extend(self._pop_expired_locked(now))
-                session = CaptureSession(
-                    capture_id=create_capture_id(),
-                    capture_path=capture_path,
-                    bridge=bridge,
-                    last_used_monotonic=now,
-                    in_use_count=initial_in_use_count,
-                )
-                self._sessions[session.capture_id] = session
-                added = True
-                to_close.extend(self._pop_excess_idle_locked(exclude_ids={session.capture_id}))
-        except Exception:
-            if not added:
-                try:
-                    bridge.close()
-                except Exception:
-                    logger.debug("Failed to close an unregistered bridge.", exc_info=True)
-            raise
+                path_key = _capture_path_key(capture_path)
+                existing_id = self._path_index.get(path_key)
+                existing = self._sessions.get(existing_id) if existing_id is not None else None
+                if existing is not None:
+                    existing.in_use_count += initial_in_use_count
+                    existing.open_count += 1
+                    existing.last_used_monotonic = now
+                    session = existing
+                    reused = True
+                else:
+                    bridge = self._bridge_factory()
+                    session = CaptureSession(
+                        capture_id=create_capture_id(),
+                        capture_path=capture_path,
+                        bridge=bridge,
+                        last_used_monotonic=now,
+                        in_use_count=initial_in_use_count,
+                    )
+                    self._sessions[session.capture_id] = session
+                    self._path_index[path_key] = session.capture_id
+                    reused = False
+                    to_close.extend(self._pop_excess_idle_locked(exclude_ids={session.capture_id}))
         finally:
             self._close_sessions(to_close)
         self._start_janitor_if_needed()
-        return session
+        return session, reused
 
     @contextmanager
     def lease(self, capture_id: str) -> Iterator[CaptureSession]:
@@ -166,6 +187,26 @@ class CaptureSessionPool:
     def get(self, capture_id: str) -> CaptureSession | None:
         with self._lock:
             return self._sessions.get(capture_id)
+
+    def find_by_path(self, capture_path: str) -> CaptureSession | None:
+        with self._lock:
+            capture_id = self._path_index.get(_capture_path_key(capture_path))
+            return self._sessions.get(capture_id) if capture_id is not None else None
+
+    def list_sessions(self) -> list[dict[str, object]]:
+        now = self._monotonic()
+        with self._lock:
+            sessions = sorted(self._sessions.values(), key=lambda item: (item.capture_path, item.capture_id))
+            return [
+                {
+                    "capture_id": session.capture_id,
+                    "capture_path": session.capture_path,
+                    "in_use_count": session.in_use_count,
+                    "open_count": session.open_count,
+                    "idle_seconds": max(0.0, now - session.last_used_monotonic),
+                }
+                for session in sessions
+            ]
 
     def release(self, capture_id: str) -> None:
         now = self._monotonic()
@@ -181,7 +222,7 @@ class CaptureSessionPool:
 
     def close(self, capture_id: str) -> bool:
         with self._lock:
-            session = self._sessions.pop(capture_id, None)
+            session = self._pop_session_locked(capture_id)
         self._close_sessions([session] if session is not None else [])
         return session is not None
 
@@ -200,6 +241,7 @@ class CaptureSessionPool:
         with self._lock:
             sessions = list(self._sessions.values())
             self._sessions.clear()
+            self._path_index.clear()
         self._close_sessions(sessions)
 
     def shutdown(self) -> None:
@@ -236,7 +278,7 @@ class CaptureSessionPool:
             for capture_id, session in self._sessions.items()
             if session.in_use_count == 0 and (now - session.last_used_monotonic) > self.idle_timeout_seconds
         ]
-        return [self._sessions.pop(capture_id) for capture_id in expired_ids]
+        return [session for capture_id in expired_ids if (session := self._pop_session_locked(capture_id)) is not None]
 
     def _pop_excess_idle_locked(self, exclude_ids: set[str] | None = None) -> list[CaptureSession]:
         if self.max_sessions <= 0 or len(self._sessions) <= self.max_sessions:
@@ -252,7 +294,20 @@ class CaptureSessionPool:
             key=lambda session: (session.last_used_monotonic, session.capture_id),
         )
         remove_count = min(len(candidates), len(self._sessions) - self.max_sessions)
-        return [self._sessions.pop(session.capture_id) for session in candidates[:remove_count]]
+        removed = []
+        for session in candidates[:remove_count]:
+            popped = self._pop_session_locked(session.capture_id)
+            if popped is not None:
+                removed.append(popped)
+        return removed
+
+    def _pop_session_locked(self, capture_id: str) -> CaptureSession | None:
+        session = self._sessions.pop(capture_id, None)
+        if session is not None:
+            path_key = _capture_path_key(session.capture_path)
+            if self._path_index.get(path_key) == capture_id:
+                self._path_index.pop(path_key, None)
+        return session
 
     def _close_sessions(self, sessions: list[CaptureSession]) -> None:
         _close_session_snapshot(sessions)

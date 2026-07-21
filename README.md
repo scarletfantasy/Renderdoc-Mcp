@@ -29,20 +29,27 @@ This repository now exposes an AI-first v2 MCP surface:
 
 - `renderdoc_open_capture`
 - `renderdoc_close_capture`
+- `renderdoc_list_open_captures`
+- `renderdoc_get_server_status`
 - `renderdoc_get_capture_overview`
 - `renderdoc_get_analysis_worklist`
 - `renderdoc_list_passes`
 - `renderdoc_get_pass_summary`
 - `renderdoc_list_timing_events`
 - `renderdoc_list_actions`
+- `renderdoc_search_actions`
 - `renderdoc_get_action_summary`
 - `renderdoc_get_pipeline_overview`
+- `renderdoc_get_event_dossier`
+- `renderdoc_get_event_dossiers`
 - `renderdoc_list_pipeline_bindings`
 - `renderdoc_get_shader_summary`
 - `renderdoc_get_shader_code_chunk`
+- `renderdoc_search_shader_code`
 - `renderdoc_list_resources`
 - `renderdoc_get_resource_summary`
 - `renderdoc_list_resource_usages`
+- `renderdoc_search_resource_bindings`
 - `renderdoc_get_pixel_history`
 - `renderdoc_debug_pixel`
 - `renderdoc_trace_bad_pixel`
@@ -50,15 +57,31 @@ This repository now exposes an AI-first v2 MCP surface:
 - `renderdoc_start_pixel_shader_debug`
 - `renderdoc_start_compute_shader_debug`
 - `renderdoc_continue_shader_debug`
+- `renderdoc_analyze_shader_debug`
 - `renderdoc_get_shader_debug_step`
 - `renderdoc_end_shader_debug`
 - `renderdoc_get_texture_data`
 - `renderdoc_get_buffer_data`
+- `renderdoc_create_investigation`
+- `renderdoc_add_investigation_capture`
+- `renderdoc_set_investigation_focus`
+- `renderdoc_pin_investigation_evidence`
+- `renderdoc_get_investigation_summary`
+- `renderdoc_list_investigations`
+- `renderdoc_close_investigation`
+- `renderdoc_compare_events`
+- `renderdoc_compare_texture_regions`
 - `renderdoc_save_texture_to_file`
 - `renderdoc://recent-captures`
 - `renderdoc://capture/{capture_id}/overview`
 
 ## Quick start
+
+If setup is uncertain, inspect the server without launching replay:
+
+```powershell
+renderdoc_get_server_status()
+```
 
 Open a capture first:
 
@@ -66,7 +89,7 @@ Open a capture first:
 renderdoc_open_capture(capture_path="C:\\captures\\frame.rdc")
 ```
 
-The response includes `capture_id`, `capture_path`, and a compact capture overview.
+The response includes `capture_id`, `capture_path`, and a compact capture overview. Opening the same normalized path again reuses the same bridge and `capture_id`; inspect retained sessions with `renderdoc_list_open_captures`.
 
 `renderdoc_get_capture_overview` also reports capability flags such as `shader_debugging`, which indicates whether the active replay device can create RenderDoc shader debug traces for this capture.
 
@@ -80,7 +103,7 @@ renderdoc_get_capture_overview(capture_id="<capture_id>")
 renderdoc_get_analysis_worklist(capture_id="<capture_id>")
 ```
 
-When you are done:
+Keep the session open across related turns. When the investigation is explicitly done:
 
 ```powershell
 renderdoc_close_capture(capture_id="<capture_id>")
@@ -136,10 +159,10 @@ renderdoc_list_timing_events(
 
 `gpu_time_ms` comes from RenderDoc replay counters. The same `.rdc` can produce different values across runs or sessions, so timing is best used for hotspot guidance and within-run ordering.
 
-Navigate actions by parent event id:
+Use `renderdoc_list_actions` for direct children. Use recursive search when draws are nested under unknown marker depth:
 
 ```powershell
-renderdoc_list_actions(capture_id="<capture_id>", limit=50)
+renderdoc_search_actions(capture_id="<capture_id>", flags_filter="draw", query="BasePass", limit=50)
 ```
 
 ```powershell
@@ -155,18 +178,14 @@ renderdoc_list_actions(
 renderdoc_get_action_summary(capture_id="<capture_id>", event_id=1234)
 ```
 
-Inspect the pipeline in two steps:
+Once an event is known, prefer one bounded dossier over separate action, pass, pipeline, shader, and binding calls:
 
 ```powershell
-renderdoc_get_pipeline_overview(capture_id="<capture_id>", event_id=1234)
-```
-
-```powershell
-renderdoc_list_pipeline_bindings(
+renderdoc_get_event_dossier(
   capture_id="<capture_id>",
   event_id=1234,
-  binding_kind="descriptor_accesses",
-  limit=50
+  binding_kinds=["output_targets", "shaders", "read_only_resources", "read_write_resources"],
+  binding_limit=50
 )
 ```
 
@@ -181,12 +200,13 @@ renderdoc_get_shader_summary(
 ```
 
 ```powershell
-renderdoc_get_shader_code_chunk(
+renderdoc_search_shader_code(
   capture_id="<capture_id>",
   event_id=1234,
   stage="pixel",
-  start_line=1,
-  line_count=200
+  query="load|store|sample|atomic|discard",
+  regex=true,
+  context_lines=2
 )
 ```
 
@@ -238,6 +258,19 @@ renderdoc_get_buffer_data(
 )
 ```
 
+Single and batch dossiers enforce a global binding/response budget. A batch that stops early reports `unprocessed_event_ids`, which can be submitted in the next bounded call.
+
+`renderdoc_list_resource_usages` is the fast structural RT/depth writer and copy/resolve relationship index (`rt_texture_v1`); it does not claim complete shader read/write coverage. Use the bounded cross-API pipeline scan for shader-visible resources and constant blocks:
+
+```powershell
+renderdoc_search_resource_bindings(
+  capture_id="<capture_id>",
+  resource_id="ResourceId::123",
+  scan_limit=100,
+  match_limit=50
+)
+```
+
 To locate sparse or unexpectedly active areas before choosing a pixel to debug:
 
 ```powershell
@@ -246,12 +279,15 @@ renderdoc_probe_texture_regions(
   texture_id="ResourceId::123",
   x=0,
   y=0,
-  width=256,
-  height=256,
-  channel_mode="any",
+  width=128,
+  height=128,
+  channel_mode="local_outlier",
   threshold=0.5
 )
 ```
+
+Besides threshold modes (`luma`, `max_rgb`, `alpha`, and `any`), `channel_mode` supports `nan_inf`, `local_outlier`, and `gradient` for common correctness searches without exporting a full texture.
+If `width` and `height` are omitted, the probe defaults to 64×64; explicit windows are limited to 128×128 and 16,384 pixels.
 
 Pixel debugging tools are still available:
 
@@ -293,7 +329,7 @@ renderdoc_start_pixel_shader_debug(
   event_id=1234,
   x=512,
   y=384,
-  state_limit=1
+  state_limit=64
 )
 ```
 
@@ -307,7 +343,7 @@ renderdoc_start_compute_shader_debug(
   thread_x=1,
   thread_y=0,
   thread_z=0,
-  state_limit=1
+  state_limit=64
 )
 ```
 
@@ -315,7 +351,18 @@ renderdoc_start_compute_shader_debug(
 renderdoc_continue_shader_debug(
   capture_id="<capture_id>",
   shader_debug_id="<shader_debug_id>",
-  state_limit=1
+  state_limit=64
+)
+```
+
+For root-cause triage, summarize the remaining trace server-side and fetch only interesting steps in detail:
+
+```powershell
+renderdoc_analyze_shader_debug(
+  capture_id="<capture_id>",
+  shader_debug_id="<shader_debug_id>",
+  max_steps=4096,
+  max_interesting_steps=32
 )
 ```
 
@@ -333,6 +380,32 @@ renderdoc_end_shader_debug(
   shader_debug_id="<shader_debug_id>"
 )
 ```
+
+For multi-turn or regression work, create an investigation, persist the current focus/evidence, and compare events or texture regions without dumping both raw payloads. Investigation state is in-memory and does not keep a closed capture alive.
+
+```powershell
+renderdoc_create_investigation(name="GI regression", capture_ids=["<baseline_id>", "<candidate_id>"])
+renderdoc_set_investigation_focus(
+  investigation_id="<investigation_id>",
+  capture_id="<candidate_id>",
+  event_id=1250,
+  texture_id="ResourceId::123",
+  x=512,
+  y=384
+)
+renderdoc_get_investigation_summary(investigation_id="<investigation_id>")
+renderdoc_compare_events(
+  baseline_capture_id="<baseline_id>", baseline_event_id=1200,
+  candidate_capture_id="<candidate_id>", candidate_event_id=1250
+)
+renderdoc_compare_texture_regions(
+  baseline_capture_id="<baseline_id>", baseline_texture_id="ResourceId::100",
+  candidate_capture_id="<candidate_id>", candidate_texture_id="ResourceId::123",
+  x=496, y=368, width=32, height=32
+)
+```
+
+If a later turn no longer has the investigation id, recover active ids and focus with `renderdoc_list_investigations()`.
 
 ## Install
 
@@ -370,9 +443,10 @@ uv run renderdoc-benchmark-ai-surface --capture "C:\captures\sample.rdc"
 The benchmark:
 
 - opens the capture
-- runs the compact overview -> worklist -> pass -> event -> resource drilldown flow
+- exercises history-derived scenarios for nested action discovery, correctness dossiers, resource attribution, shader root cause, continuation reuse, and event regression
 - measures response bytes, approximate token cost, and elapsed time
 - computes `payload_score`, `latency_score`, and `composite_score`
+- checks scenario call budgets, an ordinary-workflow budget of 20 calls, and a 256 KiB maximum single response
 - appends a JSONL record to `benchmarks/ai_surface_history.jsonl`
 - can optionally compare the current result against an older git ref such as `HEAD^`
 
@@ -454,20 +528,27 @@ Tests that need a locally installed RenderDoc build and a replayable `.rdc` capt
 
 - `renderdoc_open_capture`
 - `renderdoc_close_capture`
+- `renderdoc_list_open_captures`
+- `renderdoc_get_server_status`
 - `renderdoc_get_capture_overview`
 - `renderdoc_get_analysis_worklist`
 - `renderdoc_list_passes`
 - `renderdoc_get_pass_summary`
 - `renderdoc_list_timing_events`
 - `renderdoc_list_actions`
+- `renderdoc_search_actions`
 - `renderdoc_get_action_summary`
 - `renderdoc_get_pipeline_overview`
+- `renderdoc_get_event_dossier`
+- `renderdoc_get_event_dossiers`
 - `renderdoc_list_pipeline_bindings`
 - `renderdoc_get_shader_summary`
 - `renderdoc_get_shader_code_chunk`
+- `renderdoc_search_shader_code`
 - `renderdoc_list_resources`
 - `renderdoc_get_resource_summary`
 - `renderdoc_list_resource_usages`
+- `renderdoc_search_resource_bindings`
 - `renderdoc_get_pixel_history`
 - `renderdoc_debug_pixel`
 - `renderdoc_trace_bad_pixel`
@@ -475,21 +556,39 @@ Tests that need a locally installed RenderDoc build and a replayable `.rdc` capt
 - `renderdoc_start_pixel_shader_debug`
 - `renderdoc_start_compute_shader_debug`
 - `renderdoc_continue_shader_debug`
+- `renderdoc_analyze_shader_debug`
 - `renderdoc_get_shader_debug_step`
 - `renderdoc_end_shader_debug`
 - `renderdoc_get_texture_data`
 - `renderdoc_get_buffer_data`
+- `renderdoc_create_investigation`
+- `renderdoc_add_investigation_capture`
+- `renderdoc_set_investigation_focus`
+- `renderdoc_pin_investigation_evidence`
+- `renderdoc_get_investigation_summary`
+- `renderdoc_list_investigations`
+- `renderdoc_close_investigation`
+- `renderdoc_compare_events`
+- `renderdoc_compare_texture_regions`
 - `renderdoc_save_texture_to_file`
 - `renderdoc://recent-captures`
 - `renderdoc://capture/{capture_id}/overview`
 
 ## 推荐工作流
 
+如果安装状态不确定，先做不会启动 replay 的只读检查：
+
+```powershell
+renderdoc_get_server_status()
+```
+
 先打开 capture：
 
 ```powershell
 renderdoc_open_capture(capture_path="C:\\captures\\frame.rdc")
 ```
+
+同一路径会复用已有 bridge 和 `capture_id`。相关的多轮分析中持续复用该 id，可通过 `renderdoc_list_open_captures` 恢复当前会话；不要在每轮结束时关闭 capture。
 
 先拿整体概览和工作清单：
 
@@ -500,6 +599,8 @@ renderdoc_get_capture_overview(capture_id="<capture_id>")
 ```powershell
 renderdoc_get_analysis_worklist(capture_id="<capture_id>", focus="performance", limit=10)
 ```
+
+正确性问题改用 `focus="correctness"`。它会优先给出晚帧 writer/copy 候选，再沿事件证据继续检查。
 
 再按层级钻取：
 
@@ -529,22 +630,39 @@ renderdoc_list_timing_events(
 ```
 
 ```powershell
-renderdoc_list_actions(capture_id="<capture_id>", limit=50)
+renderdoc_search_actions(
+  capture_id="<capture_id>",
+  query="BasePass",
+  flags_filter="draw",
+  limit=50
+)
 ```
 
-```powershell
-renderdoc_get_pipeline_overview(capture_id="<capture_id>", event_id=1234)
-```
+`renderdoc_list_actions` 只浏览直接子节点；marker 深度未知时优先用递归的 `renderdoc_search_actions`。确定事件后，用一次有界 dossier 合并 action、pass、pipeline 和所需 bindings：
 
 ```powershell
-renderdoc_get_shader_code_chunk(
+renderdoc_get_event_dossier(
+  capture_id="<capture_id>",
+  event_id=1234,
+  binding_kinds=["output_targets", "shaders", "read_only_resources", "read_write_resources"],
+  binding_limit=50
+)
+```
+
+单个和批量 dossier 都有全局 binding/响应预算；批量结果若提前停止，会返回 `unprocessed_event_ids`，下一次继续提交这些 id 即可。
+
+```powershell
+renderdoc_search_shader_code(
   capture_id="<capture_id>",
   event_id=1234,
   stage="pixel",
-  start_line=1,
-  line_count=200
+  query="load|store|sample|atomic|discard",
+  regex=true,
+  context_lines=2
 )
 ```
+
+只在需要完整上下文时再用 `renderdoc_get_shader_code_chunk` 分块读取反汇编。
 
 ```powershell
 renderdoc_start_pixel_shader_debug(
@@ -552,9 +670,11 @@ renderdoc_start_pixel_shader_debug(
   event_id=1234,
   x=512,
   y=384,
-  state_limit=1
+  state_limit=64
 )
 ```
+
+拿到 `shader_debug_id` 后，用 `renderdoc_analyze_shader_debug(max_steps=4096)` 在服务端汇总剩余 trace，再只读取少量关键 step；结束时调用 `renderdoc_end_shader_debug`。
 
 ```powershell
 renderdoc_list_resources(capture_id="<capture_id>", kind="all", limit=50, sort_by="size")
@@ -583,6 +703,17 @@ renderdoc_get_buffer_data(
 )
 ```
 
+`renderdoc_list_resource_usages` 是快速的结构化 RT/depth/copy/resolve 索引（`rt_texture_v1`），不宣称覆盖所有 shader read/write。检查 shader 可见资源或 constant block 时使用有界 pipeline 扫描：
+
+```powershell
+renderdoc_search_resource_bindings(
+  capture_id="<capture_id>",
+  resource_id="ResourceId::123",
+  scan_limit=100,
+  match_limit=50
+)
+```
+
 在选择要调试的像素前，可以先扫描稀疏或异常活跃区域：
 
 ```powershell
@@ -591,14 +722,34 @@ renderdoc_probe_texture_regions(
   texture_id="ResourceId::123",
   x=0,
   y=0,
-  width=256,
-  height=256,
-  channel_mode="any",
+  width=128,
+  height=128,
+  channel_mode="local_outlier",
   threshold=0.5
 )
 ```
 
-完成后关闭：
+除阈值模式外，`channel_mode` 还支持 `nan_inf`、`local_outlier` 和 `gradient`，可直接筛查非有限值、局部离群与边缘突变。
+省略 `width`、`height` 时默认扫描 64×64；显式窗口最多 128×128，且总像素数不能超过 16,384。
+
+跨轮次或跨 capture 回归分析时，用 investigation 保存当前 focus 和证据；事件与小纹理区域可直接做语义 diff：
+
+```powershell
+renderdoc_create_investigation(name="GI 回归", capture_ids=["<baseline_id>", "<candidate_id>"])
+renderdoc_set_investigation_focus(
+  investigation_id="<investigation_id>",
+  capture_id="<candidate_id>",
+  event_id=1250
+)
+renderdoc_compare_events(
+  baseline_capture_id="<baseline_id>", baseline_event_id=1200,
+  candidate_capture_id="<candidate_id>", candidate_event_id=1250
+)
+```
+
+后续轮次若丢失了 investigation id，可调用 `renderdoc_list_investigations()` 恢复当前 id 和 focus。
+
+所有相关轮次明确完成后再关闭：
 
 ```powershell
 renderdoc_close_capture(capture_id="<capture_id>")

@@ -24,6 +24,11 @@ class ShaderDebugOps(BridgeComponent):
                 params.get("shader_debug_id", ""),
                 int(params.get("state_limit", 32)),
             ),
+            "analyze_shader_debug": lambda params: self._analyze_shader_debug(
+                params.get("shader_debug_id", ""),
+                int(params.get("max_steps", 4096)),
+                int(params.get("max_interesting_steps", 32)),
+            ),
             "get_shader_debug_step": lambda params: self._get_shader_debug_step(
                 params.get("shader_debug_id", ""),
                 int(params.get("step_index", 0)),
@@ -56,6 +61,9 @@ class ShaderDebugOps(BridgeComponent):
 
     def _continue_shader_debug(self, shader_debug_id, state_limit):
         return self._call_bridge_client("_continue_shader_debug", shader_debug_id, state_limit)
+
+    def _analyze_shader_debug(self, shader_debug_id, max_steps, max_interesting_steps):
+        return self._call_bridge_client("_analyze_shader_debug", shader_debug_id, max_steps, max_interesting_steps)
 
     def _get_shader_debug_step(self, shader_debug_id, step_index, change_limit):
         return self._call_bridge_client("_get_shader_debug_step", shader_debug_id, step_index, change_limit)

@@ -36,6 +36,18 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         lambda application: application.captures.renderdoc_close_capture,
     ),
     ToolSpec(
+        "renderdoc_list_open_captures",
+        "List reusable open capture sessions, their ids, paths, lease counts, and idle time.",
+        "get_capture_status",
+        lambda application: application.captures.renderdoc_list_open_captures,
+    ),
+    ToolSpec(
+        "renderdoc_get_server_status",
+        "Report backend configuration, extension freshness, package versions, issues, and reusable open sessions without launching replay.",
+        "get_capture_status",
+        lambda application: application.captures.renderdoc_get_server_status,
+    ),
+    ToolSpec(
         "renderdoc_get_capture_overview",
         "Return compact capture, frame, statistics, and capability overview data for an open capture.",
         "get_capture_overview",
@@ -72,6 +84,12 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         lambda application: application.actions.renderdoc_list_actions,
     ),
     ToolSpec(
+        "renderdoc_search_actions",
+        "Recursively search action descendants by name, flags, event range, or known RT/copy resource usage.",
+        "search_actions",
+        lambda application: application.actions.renderdoc_search_actions,
+    ),
+    ToolSpec(
         "renderdoc_get_action_summary",
         "Return a compact summary for a single RenderDoc event_id.",
         "get_action_summary",
@@ -82,6 +100,18 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         "Return a compact pipeline overview with counts and shader stage summaries for an event.",
         "get_pipeline_overview",
         lambda application: application.actions.renderdoc_get_pipeline_overview,
+    ),
+    ToolSpec(
+        "renderdoc_get_event_dossier",
+        "Return action, pass, pipeline, shader, output, and selected binding evidence for one event in one call.",
+        "get_event_dossier",
+        lambda application: application.actions.renderdoc_get_event_dossier,
+    ),
+    ToolSpec(
+        "renderdoc_get_event_dossiers",
+        "Return compact event dossiers for up to 32 event ids with per-event failures and resumable unprocessed ids when the response budget is reached.",
+        "get_event_dossiers",
+        lambda application: application.actions.renderdoc_get_event_dossiers,
     ),
     ToolSpec(
         "renderdoc_list_pipeline_bindings",
@@ -102,6 +132,12 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         lambda application: application.actions.renderdoc_get_shader_code_chunk,
     ),
     ToolSpec(
+        "renderdoc_search_shader_code",
+        "Search complete cached shader disassembly server-side and return bounded matching lines with context.",
+        "search_shader_code",
+        lambda application: application.actions.renderdoc_search_shader_code,
+    ),
+    ToolSpec(
         "renderdoc_list_resources",
         "List paged texture and buffer resources with compact rows and no duplicated arrays.",
         "list_resources",
@@ -118,6 +154,12 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         "List paged direct draw or action events that use a texture as an RT, depth target, copy source, or copy destination.",
         "list_resource_usages",
         lambda application: application.resources.renderdoc_list_resource_usages,
+    ),
+    ToolSpec(
+        "renderdoc_search_resource_bindings",
+        "Scan bounded draw/dispatch pipeline states for shader reads, writes, and constant-block bindings of a resource.",
+        "search_resource_bindings",
+        lambda application: application.resources.renderdoc_search_resource_bindings,
     ),
     ToolSpec(
         "renderdoc_get_pixel_history",
@@ -139,7 +181,7 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
     ),
     ToolSpec(
         "renderdoc_probe_texture_regions",
-        "Scan a bounded texture region, detect active connected regions, and suggest candidate pixels for correctness investigations.",
+        "Scan a bounded texture region for threshold activity, NaN/Inf, local outliers, or gradients and suggest candidate pixels.",
         "probe_texture_regions",
         lambda application: application.resources.renderdoc_probe_texture_regions,
     ),
@@ -160,6 +202,12 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         "Continue a shader debugging session and return the next compact batch of states.",
         "continue_shader_debug",
         lambda application: application.resources.renderdoc_continue_shader_debug,
+    ),
+    ToolSpec(
+        "renderdoc_analyze_shader_debug",
+        "Consume and summarize up to 8192 shader debug states into flags, changed variables, and interesting steps.",
+        "analyze_shader_debug",
+        lambda application: application.resources.renderdoc_analyze_shader_debug,
     ),
     ToolSpec(
         "renderdoc_get_shader_debug_step",
@@ -184,6 +232,60 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         "Return a bounded hex or base64 buffer window with AI-friendly small defaults.",
         "get_buffer_data",
         lambda application: application.resources.renderdoc_get_buffer_data,
+    ),
+    ToolSpec(
+        "renderdoc_create_investigation",
+        "Create an in-memory investigation workspace and optionally attach up to eight open captures.",
+        "get_capture_status",
+        lambda application: application.investigation.renderdoc_create_investigation,
+    ),
+    ToolSpec(
+        "renderdoc_add_investigation_capture",
+        "Attach an open capture to an investigation under a stable label such as baseline or candidate.",
+        "get_capture_status",
+        lambda application: application.investigation.renderdoc_add_investigation_capture,
+    ),
+    ToolSpec(
+        "renderdoc_set_investigation_focus",
+        "Persist the current capture, event, resource, pixel, or shader-debug focus for later turns.",
+        "get_capture_status",
+        lambda application: application.investigation.renderdoc_set_investigation_focus,
+    ),
+    ToolSpec(
+        "renderdoc_pin_investigation_evidence",
+        "Pin a named event, pass, resource, shader trace, finding, or note in an investigation.",
+        "get_capture_status",
+        lambda application: application.investigation.renderdoc_pin_investigation_evidence,
+    ),
+    ToolSpec(
+        "renderdoc_get_investigation_summary",
+        "Restore an investigation's capture aliases, current focus, pinned evidence, and next calls.",
+        "get_capture_status",
+        lambda application: application.investigation.renderdoc_get_investigation_summary,
+    ),
+    ToolSpec(
+        "renderdoc_list_investigations",
+        "List active in-memory investigations with their ids, focus, and compact counts for later-turn recovery.",
+        "get_capture_status",
+        lambda application: application.investigation.renderdoc_list_investigations,
+    ),
+    ToolSpec(
+        "renderdoc_close_investigation",
+        "Close an in-memory investigation without closing its capture sessions.",
+        "get_capture_status",
+        lambda application: application.investigation.renderdoc_close_investigation,
+    ),
+    ToolSpec(
+        "renderdoc_compare_events",
+        "Compare two events across the same or different captures using stable semantic pipeline snapshots.",
+        "get_event_dossier",
+        lambda application: application.investigation.renderdoc_compare_events,
+    ),
+    ToolSpec(
+        "renderdoc_compare_texture_regions",
+        "Compare bounded texture regions across captures and return aggregate error plus the largest pixel deltas.",
+        "get_texture_data",
+        lambda application: application.investigation.renderdoc_compare_texture_regions,
     ),
     ToolSpec(
         "renderdoc_save_texture_to_file",

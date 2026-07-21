@@ -19,9 +19,11 @@ def create_mcp_app(application: RenderDocApplication | None = None) -> FastMCP:
     app = FastMCP(
         name="renderdoc-mcp",
         instructions=(
-            "Use renderdoc_open_capture first, then pass the returned capture_id to the other tools. "
-            "Start with renderdoc_get_capture_overview or renderdoc_get_analysis_worklist, then drill down with paged list tools. "
-            "The server launches the configured RenderDoc backend as needed and keeps each open capture session alive until closed or evicted."
+            "Use renderdoc_get_server_status when setup is uncertain, then renderdoc_open_capture; opening the same path is idempotent. "
+            "Reuse the returned capture_id and start with renderdoc_get_analysis_worklist. Use renderdoc_search_actions for recursive discovery "
+            "and renderdoc_get_event_dossier instead of separate action, pipeline, and binding calls. Create an investigation to persist focus "
+            "across turns, recover it with renderdoc_list_investigations, and use semantic event or texture comparisons for regressions. "
+            "Open sessions stay alive until explicitly closed or evicted."
         ),
     )
 
