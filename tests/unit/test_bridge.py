@@ -115,6 +115,7 @@ class FakeController:
         self.state = state or FakeState()
         self.shader_debugging = shader_debugging
         self.debug_pixel_calls: list[tuple[int, int, object]] = []
+        self.debug_thread_calls: list[tuple[tuple[int, int, int], tuple[int, int, int]]] = []
         self.continue_debug_batches: list[list[object]] = []
         self.freed_traces: list[object] = []
 
@@ -129,6 +130,10 @@ class FakeController:
 
     def DebugPixel(self, x, y, inputs):
         self.debug_pixel_calls.append((x, y, inputs))
+        return getattr(self, "trace", None)
+
+    def DebugThread(self, group_id, thread_id):
+        self.debug_thread_calls.append((tuple(group_id), tuple(thread_id)))
         return getattr(self, "trace", None)
 
     def ContinueDebug(self, debugger):
@@ -868,6 +873,60 @@ def test_bridge_client_pixel_shader_debug_converts_no_preference_to_uint32(monke
     assert controller.debug_pixel_calls[0][2].sample == 0xFFFFFFFF
     assert controller.debug_pixel_calls[0][2].primitive == 0xFFFFFFFF
     assert controller.debug_pixel_calls[0][2].view == 0xFFFFFFFF
+
+
+def test_bridge_client_compute_shader_debug_sessions_buffer_continue_states(monkeypatch) -> None:
+    controller = FakeController(state=FakeState(shader_bound=True), shader_debugging=True)
+    trace = SimpleNamespace(
+        debugger=object(),
+        stage="Compute",
+        inputs=[_shader_variable("dispatchThreadId", [3937, 2096, 0], "UInt")],
+        constantBlocks=[],
+        readOnlyResources=[],
+        readWriteResources=[],
+        samplers=[],
+        sourceVars=[SimpleNamespace(name="result")],
+        instInfo=[
+            SimpleNamespace(
+                instruction=0,
+                lineInfo=SimpleNamespace(fileIndex=0, lineStart=42, lineEnd=42, colStart=1, colEnd=12, disassemblyLine=1),
+                sourceVars=[SimpleNamespace(name="result")],
+            )
+        ],
+    )
+    state0 = SimpleNamespace(
+        stepIndex=0,
+        nextInstruction=0,
+        flags="ShaderEvents.None",
+        changes=[
+            SimpleNamespace(
+                before=_shader_variable("result", [0.0, 0.0, 0.0, 1.0]),
+                after=_shader_variable("result", [1.0, 0.5, 0.25, 1.0]),
+            )
+        ],
+        callstack=["CSMain"],
+    )
+    controller.trace = trace
+    controller.continue_debug_batches = [[state0], []]
+
+    client = BridgeClient(FakeContext(controller))
+    monkeypatch.setattr(bridge_client_module, "_shader_stage_from_name", lambda stage_name: "Compute")
+    monkeypatch.setattr(bridge_client_module, "_action_flags", lambda action: ["dispatch"])
+
+    started = client._start_compute_shader_debug(8659, [492, 262, 0], [1, 0, 0], 1)
+
+    assert started["shader"]["stage"] == "Compute"
+    assert started["target"] == {"group_id": [492, 262, 0], "thread_id": [1, 0, 0]}
+    assert started["states"][0]["step_index"] == 0
+    assert controller.debug_thread_calls == [((492, 262, 0), (1, 0, 0))]
+
+    step = client._get_shader_debug_step(started["shader_debug_id"], 0, 10)
+    assert step["shader"]["stage"] == "Compute"
+    assert step["changes"][0]["name"] == "result"
+
+    closed = client._end_shader_debug(started["shader_debug_id"])
+    assert closed["closed"] is True
+    assert controller.freed_traces == [trace]
 
 
 def test_bridge_client_get_buffer_data_uses_checked_block_invoke(monkeypatch) -> None:

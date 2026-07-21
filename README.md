@@ -20,8 +20,9 @@ This repository now exposes an AI-first v2 MCP surface:
 
 ## Version support
 
-- Minimum supported RenderDoc version: `1.43`
+- Legacy minimum RenderDoc version: `1.36`
 - Verified baseline: `1.43`
+- RenderDoc `1.36` support is best-effort for older captures that require that replay version. Core capture opening, overview, action/resource navigation, and basic pipeline inspection are expected to work; newer RenderDoc APIs such as timing counters, descriptor details, shader disassembly, or shader debugging may report unavailable through capability flags or per-tool `available: false` payloads.
 - Newer RenderDoc builds are supported on a best-effort forward-compatible basis with API fallbacks where practical
 
 ## Features
@@ -46,6 +47,7 @@ This repository now exposes an AI-first v2 MCP surface:
 - `renderdoc_debug_pixel`
 - `renderdoc_trace_bad_pixel`
 - `renderdoc_start_pixel_shader_debug`
+- `renderdoc_start_compute_shader_debug`
 - `renderdoc_continue_shader_debug`
 - `renderdoc_get_shader_debug_step`
 - `renderdoc_end_shader_debug`
@@ -267,7 +269,7 @@ renderdoc_debug_pixel(
 )
 ```
 
-`renderdoc_debug_pixel` remains a compact low-level pixel-history summary. For actual RenderDoc pixel shader single-step debugging, use the session-based tools when `capabilities.shader_debugging` is `true`:
+`renderdoc_debug_pixel` remains a compact low-level pixel-history summary. For actual RenderDoc shader single-step debugging, use the session-based tools when `capabilities.shader_debugging` is `true`:
 
 ```powershell
 renderdoc_start_pixel_shader_debug(
@@ -275,6 +277,20 @@ renderdoc_start_pixel_shader_debug(
   event_id=1234,
   x=512,
   y=384,
+  state_limit=1
+)
+```
+
+```powershell
+renderdoc_start_compute_shader_debug(
+  capture_id="<capture_id>",
+  event_id=8659,
+  group_x=492,
+  group_y=262,
+  group_z=0,
+  thread_x=1,
+  thread_y=0,
+  thread_z=0,
   state_limit=1
 )
 ```
@@ -394,6 +410,13 @@ uv run renderdoc-mcp
 - 大结果必须分页或分块
 - 列表接口不再返回重复数组
 
+## 版本支持
+
+- 旧版最低 RenderDoc 版本：`1.36`
+- 已验证基线：`1.43`
+- RenderDoc `1.36` 兼容主要用于必须用旧版回放的 capture。打开 capture、overview、action/resource 导航、基础 pipeline 检查应尽量可用；GPU timing、descriptor 细节、shader 反汇编、shader debug 等较新的 API 如果旧版不支持，会通过 capability flag 或单个工具的 `available: false` 返回降级结果。
+- 更新版本的 RenderDoc 按 best-effort 方式继续支持，并在可行处走 API fallback。
+
 ## 功能列表
 
 - `renderdoc_open_capture`
@@ -416,6 +439,7 @@ uv run renderdoc-mcp
 - `renderdoc_debug_pixel`
 - `renderdoc_trace_bad_pixel`
 - `renderdoc_start_pixel_shader_debug`
+- `renderdoc_start_compute_shader_debug`
 - `renderdoc_continue_shader_debug`
 - `renderdoc_get_shader_debug_step`
 - `renderdoc_end_shader_debug`

@@ -518,6 +518,7 @@ class BridgeClient(object):
         self._get_buffer_data = self.resource_ops._get_buffer_data
         self._save_texture_to_file = self.resource_ops._save_texture_to_file
         self._start_pixel_shader_debug = self.shader_debug_ops._start_pixel_shader_debug
+        self._start_compute_shader_debug = self.shader_debug_ops._start_compute_shader_debug
         self._continue_shader_debug = self.shader_debug_ops._continue_shader_debug
         self._get_shader_debug_step = self.shader_debug_ops._get_shader_debug_step
         self._end_shader_debug = self.shader_debug_ops._end_shader_debug
@@ -2054,6 +2055,27 @@ class BridgeClient(object):
                 pass
         return session
 
+    def _normalize_shader_debug_uvec3(self, value, field_name):
+        items = _safe_list(value)
+        if len(items) != 3:
+            raise BridgeError(
+                "invalid_shader_debug_thread",
+                "{} must contain exactly three non-negative integer values.".format(field_name),
+                {field_name: items},
+            )
+
+        normalized = []
+        for item in items:
+            component = int(item)
+            if component < 0:
+                raise BridgeError(
+                    "invalid_shader_debug_thread",
+                    "{} must contain exactly three non-negative integer values.".format(field_name),
+                    {field_name: items},
+                )
+            normalized.append(component)
+        return normalized
+
     def _start_pixel_shader_debug(self, event_id, x, y, texture_id, sample, primitive_id, view, state_limit):
         self._ensure_capture_loaded()
         action = self._set_event(event_id)
@@ -2142,6 +2164,136 @@ class BridgeClient(object):
                     "entry_point": shader_payload.get("entry_point", ""),
                 },
                 "target": target,
+                "trace": trace,
+                "debugger": debugger,
+                "trace_summary": self._serialize_shader_debug_trace_summary(trace),
+                "history": [],
+                "history_by_step": {},
+                "pending_states": [],
+                "completed": False,
+            }
+
+            try:
+                self._fill_shader_debug_pending_states(controller, session, state_limit)
+            except Exception:
+                if hasattr(controller, "FreeTrace"):
+                    try:
+                        controller.FreeTrace(trace)
+                    except Exception:
+                        pass
+                raise
+
+            self.shader_debug_sessions[shader_debug_id] = session
+            states = self._consume_shader_debug_state_page(session, state_limit)
+            response.update(
+                {
+                    "shader_debug_id": shader_debug_id,
+                    "api": session["api"],
+                    "action": dict(session["action"]),
+                    "shader": dict(session["shader"]),
+                    "target": dict(session["target"]),
+                    "trace_summary": dict(session["trace_summary"]),
+                    "returned_state_count": len(states),
+                    "states": states,
+                    "meta": {
+                        "completed": bool(session["completed"]),
+                        "has_more": self._shader_debug_has_more(session),
+                    },
+                }
+            )
+
+        self._block_invoke_checked(callback)
+        return response
+
+    def _start_compute_shader_debug(self, event_id, group_id, thread_id, state_limit):
+        self._ensure_capture_loaded()
+        action = self._set_event(event_id)
+        normalized_group_id = self._normalize_shader_debug_uvec3(group_id, "group_id")
+        normalized_thread_id = self._normalize_shader_debug_uvec3(thread_id, "thread_id")
+        response = {"event_id": int(event_id)}
+
+        def callback(controller):
+            if not self._controller_shader_debugging_supported(controller):
+                raise BridgeError(
+                    "shader_debugging_not_supported",
+                    "The active replay device does not support shader debugging for this capture.",
+                    {"event_id": int(event_id)},
+                )
+            if "dispatch" not in _action_flags(action):
+                raise BridgeError(
+                    "shader_debug_requires_dispatch_event",
+                    "Compute shader debugging requires a dispatch event.",
+                    {"event_id": int(event_id), "flags": _action_flags(action)},
+                )
+            if not hasattr(controller, "DebugThread"):
+                raise BridgeError(
+                    "shader_debugging_not_supported",
+                    "RenderDoc did not expose compute shader debugging APIs in this build.",
+                    {"event_id": int(event_id)},
+                )
+
+            state = _call_method_variants(controller, "GetPipelineState", [()], default=None)
+            if state is None:
+                raise BridgeError(
+                    "shader_debug_trace_unavailable",
+                    "RenderDoc did not expose pipeline state for the selected event.",
+                    {"event_id": int(event_id)},
+                )
+
+            compute_stage = _shader_stage_from_name("compute")
+            shader_payload = _serialize_shader_stage(self.ctx, state, compute_stage) if compute_stage is not None else None
+            if shader_payload is None:
+                raise BridgeError(
+                    "shader_debug_trace_unavailable",
+                    "No compute shader is bound for the selected dispatch event.",
+                    {"event_id": int(event_id)},
+                )
+
+            trace = None
+            try:
+                trace = controller.DebugThread(tuple(normalized_group_id), tuple(normalized_thread_id))
+            except TypeError:
+                trace = controller.DebugThread(
+                    normalized_group_id[0],
+                    normalized_group_id[1],
+                    normalized_group_id[2],
+                    normalized_thread_id[0],
+                    normalized_thread_id[1],
+                    normalized_thread_id[2],
+                )
+
+            debugger = getattr(trace, "debugger", None)
+            if trace is None or debugger is None:
+                raise BridgeError(
+                    "shader_debug_trace_unavailable",
+                    "RenderDoc could not create a shader debug trace for the selected compute thread.",
+                    {
+                        "event_id": int(event_id),
+                        "group_id": list(normalized_group_id),
+                        "thread_id": list(normalized_thread_id),
+                    },
+                )
+
+            shader_debug_id = uuid.uuid4().hex
+            session = {
+                "shader_debug_id": shader_debug_id,
+                "event_id": int(event_id),
+                "api": _api_name(controller),
+                "action": {
+                    "event_id": int(action.eventId),
+                    "name": action.GetName(controller.GetStructuredFile()) or action.customName or "Event {}".format(action.eventId),
+                    "flags": _action_flags(action),
+                },
+                "shader": {
+                    "stage": shader_payload.get("stage", "Compute"),
+                    "shader_id": shader_payload.get("shader_id", ""),
+                    "shader_name": shader_payload.get("shader_name", ""),
+                    "entry_point": shader_payload.get("entry_point", ""),
+                },
+                "target": {
+                    "group_id": list(normalized_group_id),
+                    "thread_id": list(normalized_thread_id),
+                },
                 "trace": trace,
                 "debugger": debugger,
                 "trace_summary": self._serialize_shader_debug_trace_summary(trace),

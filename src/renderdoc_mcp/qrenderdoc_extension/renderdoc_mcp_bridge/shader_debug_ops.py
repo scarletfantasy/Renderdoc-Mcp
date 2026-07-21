@@ -14,6 +14,12 @@ class ShaderDebugOps(BridgeComponent):
                 params.get("view"),
                 int(params.get("state_limit", 32)),
             ),
+            "start_compute_shader_debug": lambda params: self._start_compute_shader_debug(
+                int(params.get("event_id", 0)),
+                params.get("group_id", [0, 0, 0]),
+                params.get("thread_id", [0, 0, 0]),
+                int(params.get("state_limit", 32)),
+            ),
             "continue_shader_debug": lambda params: self._continue_shader_debug(
                 params.get("shader_debug_id", ""),
                 int(params.get("state_limit", 32)),
@@ -36,6 +42,15 @@ class ShaderDebugOps(BridgeComponent):
             sample,
             primitive_id,
             view,
+            state_limit,
+        )
+
+    def _start_compute_shader_debug(self, event_id, group_id, thread_id, state_limit):
+        return self._call_bridge_client(
+            "_start_compute_shader_debug",
+            event_id,
+            group_id,
+            thread_id,
             state_limit,
         )
 

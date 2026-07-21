@@ -150,6 +150,12 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         lambda application: application.resources.renderdoc_start_pixel_shader_debug,
     ),
     ToolSpec(
+        "renderdoc_start_compute_shader_debug",
+        "Start a compute shader debugging session for a dispatch group and thread.",
+        "start_compute_shader_debug",
+        lambda application: application.resources.renderdoc_start_compute_shader_debug,
+    ),
+    ToolSpec(
         "renderdoc_continue_shader_debug",
         "Continue a shader debugging session and return the next compact batch of states.",
         "continue_shader_debug",

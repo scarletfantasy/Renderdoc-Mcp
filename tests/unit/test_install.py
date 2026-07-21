@@ -147,6 +147,13 @@ def test_install_metadata_includes_analysis_package_tree() -> None:
     assert "analysis/frame_analysis.py" in metadata["files"]
 
 
+def test_bundled_extension_manifest_supports_renderdoc_136() -> None:
+    manifest = resources.files("renderdoc_mcp.qrenderdoc_extension.renderdoc_mcp_bridge").joinpath("extension.json")
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+
+    assert payload["minimum_renderdoc"] == "1.36"
+
+
 def test_repo_time_extension_analysis_shim_is_importable() -> None:
     from renderdoc_mcp.qrenderdoc_extension.renderdoc_mcp_bridge.analysis import frame_analysis
 

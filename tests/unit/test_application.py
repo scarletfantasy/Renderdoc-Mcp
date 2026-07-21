@@ -382,6 +382,15 @@ class DummyBridge:
                 "returned_state_count": 0,
                 "meta": {"completed": False, "has_more": True},
             }
+        if method == "start_compute_shader_debug":
+            return {
+                "shader_debug_id": "debug-1",
+                "event_id": payload["event_id"],
+                "target": {"group_id": payload["group_id"], "thread_id": payload["thread_id"]},
+                "states": [],
+                "returned_state_count": 0,
+                "meta": {"completed": False, "has_more": True},
+            }
         if method == "continue_shader_debug":
             return {
                 "shader_debug_id": payload["shader_debug_id"],
@@ -701,6 +710,37 @@ def test_shader_debug_handlers_normalize_and_forward_arguments(tmp_path: Path) -
     ]
 
 
+def test_compute_shader_debug_handler_normalizes_and_forwards_arguments(tmp_path: Path) -> None:
+    application, created = _application()
+    capture_path = _capture(tmp_path)
+    opened = application.captures.renderdoc_open_capture(capture_path)
+
+    started = application.resources.renderdoc_start_compute_shader_debug(
+        opened["capture_id"],
+        event_id="8659",
+        group_x="492",
+        group_y="262",
+        group_z="0",
+        thread_x="1",
+        thread_y="0",
+        thread_z="0",
+        state_limit="16",
+    )
+
+    assert started["shader_debug_id"] == "debug-1"
+    assert started["target"]["group_id"] == [492, 262, 0]
+    assert started["target"]["thread_id"] == [1, 0, 0]
+    assert created[0].calls[-1] == (
+        "start_compute_shader_debug",
+        {
+            "event_id": 8659,
+            "group_id": [492, 262, 0],
+            "thread_id": [1, 0, 0],
+            "state_limit": 16,
+        },
+    )
+
+
 def test_shader_debug_validation_errors_raise_domain_exceptions(tmp_path: Path) -> None:
     application, _ = _application()
     capture_path = _capture(tmp_path)
@@ -708,6 +748,15 @@ def test_shader_debug_validation_errors_raise_domain_exceptions(tmp_path: Path) 
 
     with pytest.raises(ReplayFailureError):
         application.resources.renderdoc_start_pixel_shader_debug(opened["capture_id"], event_id=7, x=0, y=0, state_limit=999)
+    with pytest.raises(ReplayFailureError):
+        application.resources.renderdoc_start_compute_shader_debug(
+            opened["capture_id"],
+            event_id=7,
+            group_x=0,
+            group_y=0,
+            thread_x=0,
+            state_limit=999,
+        )
     with pytest.raises(ReplayFailureError):
         application.resources.renderdoc_get_shader_debug_step(opened["capture_id"], "debug-1", step_index=0, change_limit=999)
 
@@ -727,6 +776,7 @@ def test_registry_contains_new_breaking_api_surface() -> None:
         "renderdoc_probe_texture_regions",
         "renderdoc_trace_bad_pixel",
         "renderdoc_start_pixel_shader_debug",
+        "renderdoc_start_compute_shader_debug",
         "renderdoc_continue_shader_debug",
         "renderdoc_get_shader_debug_step",
         "renderdoc_end_shader_debug",

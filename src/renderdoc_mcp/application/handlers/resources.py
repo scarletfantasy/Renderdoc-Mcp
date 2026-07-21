@@ -310,6 +310,36 @@ class ResourceHandlers:
         session, result = self.context.capture_tool(capture_id, "start_pixel_shader_debug", params)
         return attach_capture(ensure_meta(result), session)
 
+    def renderdoc_start_compute_shader_debug(
+        self,
+        capture_id: str,
+        event_id: int,
+        group_x: int,
+        group_y: int,
+        group_z: int = 0,
+        thread_x: int = 0,
+        thread_y: int = 0,
+        thread_z: int = 0,
+        state_limit: int | str | None = None,
+    ) -> dict[str, Any]:
+        params = {
+            "event_id": self.context.normalize_required_int(event_id, "event_id"),
+            "group_id": [
+                self.context.normalize_non_negative_int(group_x, "group_x"),
+                self.context.normalize_non_negative_int(group_y, "group_y"),
+                self.context.normalize_non_negative_int(group_z, "group_z"),
+            ],
+            "thread_id": [
+                self.context.normalize_non_negative_int(thread_x, "thread_x"),
+                self.context.normalize_non_negative_int(thread_y, "thread_y"),
+                self.context.normalize_non_negative_int(thread_z, "thread_z"),
+            ],
+            "state_limit": self._normalize_state_limit(state_limit),
+        }
+
+        session, result = self.context.capture_tool(capture_id, "start_compute_shader_debug", params)
+        return attach_capture(ensure_meta(result), session)
+
     def renderdoc_continue_shader_debug(
         self,
         capture_id: str,
