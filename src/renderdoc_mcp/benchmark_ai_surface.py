@@ -10,7 +10,7 @@ import tarfile
 import tempfile
 import time
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -471,7 +471,7 @@ async def run_workflow(config: BenchmarkConfig) -> dict[str, Any]:
     skipped_steps: list[str] = []
     renderdoc_version = ""
     capture_id = ""
-    pass_id = ""
+    pass_id: str | None = None
     event_id: int | None = None
     stage: str | None = None
 
@@ -638,7 +638,7 @@ async def run_workflow(config: BenchmarkConfig) -> dict[str, Any]:
     stages = {name: summarize_metrics(metrics, labels) for name, labels in STAGE_GROUPS.items()}
     scores = build_scores(stages["interactive"])
     return {
-        "timestamp_utc": datetime.now(UTC).isoformat(),
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "workflow_version": WORKFLOW_VERSION,
         "capture": capture_info(config.capture_path, config.capture_label),
         "git": git_info(config.repo_root),
@@ -783,7 +783,7 @@ async def run_legacy_workflow(
     }
     scores = build_scores(stages["interactive"])
     return {
-        "timestamp_utc": datetime.now(UTC).isoformat(),
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "workflow_version": f"{WORKFLOW_VERSION}:legacy",
         "capture": capture_info(config.capture_path, config.capture_label),
         "git": git_ref_info(config.repo_root, ref),

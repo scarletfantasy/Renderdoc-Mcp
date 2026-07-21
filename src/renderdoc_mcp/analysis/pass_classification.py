@@ -47,13 +47,13 @@ _DEPTH_HINTS = ["prepass", "depth", "z pre", "hzb", "occlusion"]
 
 def build_frame_analysis(nodes, metadata):
     annotated_nodes = [_annotate_action_node(node, 0) for node in nodes]
-    action_index = {}
+    action_index = {}  # type: dict
     index_action_nodes(annotated_nodes, action_index)
     action_children_index = {"": [int(node["event_id"]) for node in annotated_nodes]}
     _index_action_children(annotated_nodes, action_children_index)
 
     top_level_passes = []
-    pass_index = {}
+    pass_index = {}  # type: dict
     for node in annotated_nodes:
         pass_payload = _build_pass_payload(node, 0, True, pass_index, "")
         if pass_payload is not None:
@@ -100,6 +100,7 @@ def build_frame_analysis(nodes, metadata):
         "action_index": action_index,
         "action_children_index": action_children_index,
         "root_action_ids": action_children_index[""],
+        "max_event_id": max(action_index) if action_index else 0,
         "resource_usage_index": build_resource_usage_index(annotated_nodes),
         "statistics": metadata["statistics"],
         "resource_counts": metadata["resource_counts"],
@@ -404,8 +405,8 @@ def _classify_pass(node, level):
     name_lower = node["name"].lower()
     stats = node["_analysis"]["stats"]
     output_summary = node["_analysis"]["output_summary"]
-    scores = {}
-    reasons = {}
+    scores = {}  # type: dict[str, float]
+    reasons = {}  # type: dict[str, list[str]]
 
     def add(category, score, reason):
         if category not in scores or score > scores[category]:

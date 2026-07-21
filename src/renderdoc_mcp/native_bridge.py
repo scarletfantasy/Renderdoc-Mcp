@@ -7,7 +7,7 @@ import time
 from collections import deque
 from pathlib import Path
 from queue import Empty, Queue
-from typing import Any, TextIO
+from typing import Any
 
 from renderdoc_mcp._bridge_base import BaseBridge
 from renderdoc_mcp.backend import NATIVE_PYTHON_BACKEND, NativePythonConfig, resolve_native_python_config

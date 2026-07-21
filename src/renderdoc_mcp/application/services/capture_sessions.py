@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any
+from contextlib import contextmanager
+from typing import Any, Iterator
 
 from renderdoc_mcp.application.services.input_normalizer import InputNormalizer
 from renderdoc_mcp.errors import InvalidCaptureIDError
@@ -22,6 +23,11 @@ class CaptureSessionService:
 
     def open_normalized_capture(self, capture_path: str) -> CaptureSession:
         return self._session_pool.open(capture_path)
+
+    @contextmanager
+    def open_normalized_capture_lease(self, capture_path: str) -> Iterator[CaptureSession]:
+        with self._session_pool.open_lease(capture_path) as session:
+            yield session
 
     def close_capture(self, capture_id: str) -> bool:
         normalized_id = self._normalizer.normalize_required_capture_id(capture_id)

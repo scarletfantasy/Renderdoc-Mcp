@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Protocol, TextIO
+from typing import Any, Protocol
 
 from renderdoc_mcp._bridge_base import BaseBridge
 from renderdoc_mcp.backend import DEFAULT_BACKEND, NATIVE_PYTHON_BACKEND, current_backend_name
@@ -43,13 +43,22 @@ class QRenderDocBridge(BaseBridge):
         self._server_socket: socket.socket | None = None
         self._connection: socket.socket | None = None
         self._log_path: str | None = None
+        self._cleanup_log_on_close = False
 
     def _close_extra_resources(self) -> None:
+        log_path = self._log_path
+        cleanup_log = self._cleanup_log_on_close
         close_socket(self._connection)
         self._connection = None
         close_socket(self._server_socket)
         self._server_socket = None
         self._log_path = None
+        self._cleanup_log_on_close = False
+        if cleanup_log and log_path:
+            try:
+                Path(log_path).unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def ensure_started(self) -> None:
         if self._reader is not None and self._writer is not None and self._connection is not None:
@@ -76,6 +85,7 @@ class QRenderDocBridge(BaseBridge):
             log_path = str(Path(tempfile.gettempdir()) / ("renderdoc_mcp_bridge_{}.log".format(token)))
             last_log_path = log_path
             self._log_path = log_path
+            self._cleanup_log_on_close = False
             env = os.environ.copy()
             env.update(
                 {
@@ -87,7 +97,14 @@ class QRenderDocBridge(BaseBridge):
                 }
             )
 
-            self._process = subprocess.Popen([str(qrenderdoc_path)], cwd=str(qrenderdoc_path.parent), env=env)
+            self._process = subprocess.Popen(
+                [str(qrenderdoc_path)],
+                cwd=str(qrenderdoc_path.parent),
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
 
             deadline = time.monotonic() + self.timeout_seconds
             connection: socket.socket | None = None
@@ -132,12 +149,17 @@ class QRenderDocBridge(BaseBridge):
             self._writer = writer
             close_socket(self._server_socket)
             self._server_socket = None
+            self._cleanup_log_on_close = True
             return
 
         raise BridgeHandshakeTimeoutError(self.timeout_seconds, last_log_path)
 
     def _accept_hello(self, hello: dict[str, Any], token: str) -> None:
-        if hello.get("type") != "hello" or hello.get("token") != token:
+        if (
+            hello.get("type") != "hello"
+            or hello.get("token") != token
+            or hello.get("protocol_version") != BRIDGE_PROTOCOL_VERSION
+        ):
             self.renderdoc_version = None
             raise ReplayFailureError(
                 "Received an invalid bridge handshake from qrenderdoc.",
@@ -169,14 +191,14 @@ class QRenderDocBridge(BaseBridge):
                 },
             )
             response = read_message(self._reader)
-        except OSError as exc:
-            self.close()
-            raise BridgeDisconnectedError() from exc
-        except ConnectionError as exc:
+        except (OSError, ConnectionError, ValueError) as exc:
+            self._cleanup_log_on_close = False
             self.close()
             raise BridgeDisconnectedError() from exc
 
         if response.get("type") != "response" or response.get("id") != request_id:
+            self._cleanup_log_on_close = False
+            self.close()
             raise ReplayFailureError("Received an invalid bridge response.", {"response": response})
 
         error = response.get("error")
@@ -185,6 +207,8 @@ class QRenderDocBridge(BaseBridge):
 
         result = response.get("result")
         if not isinstance(result, dict):
+            self._cleanup_log_on_close = False
+            self.close()
             raise ReplayFailureError("Bridge response did not include a JSON object result.")
         return result
 

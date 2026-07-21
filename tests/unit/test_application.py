@@ -527,6 +527,10 @@ def test_validation_errors_raise_domain_exceptions(tmp_path: Path) -> None:
         application.resources.renderdoc_list_resource_usages(opened["capture_id"], "ResourceId::1", usage_kind="bogus")
     with pytest.raises(ReplayFailureError):
         application.actions.renderdoc_list_pipeline_bindings(opened["capture_id"], event_id=7, binding_kind="bogus")
+    with pytest.raises(ReplayFailureError):
+        application.resources.renderdoc_get_buffer_data(opened["capture_id"], "BufferId::1", size=0)
+    with pytest.raises(ReplayFailureError):
+        application.resources.renderdoc_get_buffer_data(opened["capture_id"], "BufferId::1", size=-1)
 
 
 def test_pipeline_binding_aliases_normalize_before_forwarding(tmp_path: Path) -> None:
@@ -759,6 +763,10 @@ def test_shader_debug_validation_errors_raise_domain_exceptions(tmp_path: Path) 
         )
     with pytest.raises(ReplayFailureError):
         application.resources.renderdoc_get_shader_debug_step(opened["capture_id"], "debug-1", step_index=0, change_limit=999)
+    with pytest.raises(ReplayFailureError):
+        application.resources.renderdoc_start_pixel_shader_debug(opened["capture_id"], event_id=7, x=0, y=0, state_limit=0)
+    with pytest.raises(ReplayFailureError):
+        application.resources.renderdoc_get_shader_debug_step(opened["capture_id"], "debug-1", step_index=0, change_limit=0)
 
 
 def test_registry_contains_new_breaking_api_surface() -> None:

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import atexit
+import math
 import os
 import subprocess
 import threading
 import uuid
 from pathlib import Path
-from typing import Any, TextIO
+from typing import IO, Any
 
 from renderdoc_mcp.errors import (
     BridgeDisconnectedError,
@@ -21,12 +21,13 @@ def env_float(name: str, default: float) -> float:
     if raw is None:
         return default
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError:
         return default
+    return value if math.isfinite(value) and value > 0 else default
 
 
-def _close_text_io(stream: TextIO | None) -> None:
+def _close_text_io(stream: IO[str] | None) -> None:
     if stream is not None:
         try:
             stream.close()
@@ -58,22 +59,31 @@ class BaseBridge:
     backend_name: str = ""
 
     def __init__(self, timeout_seconds: float | None = None) -> None:
-        self.timeout_seconds = timeout_seconds or env_float("RENDERDOC_BRIDGE_TIMEOUT_SECONDS", 30.0)
+        resolved_timeout = (
+            env_float("RENDERDOC_BRIDGE_TIMEOUT_SECONDS", 30.0)
+            if timeout_seconds is None
+            else float(timeout_seconds)
+        )
+        if not math.isfinite(resolved_timeout) or resolved_timeout <= 0:
+            raise ValueError("timeout_seconds must be a finite number greater than 0.")
+        self.timeout_seconds = resolved_timeout
         self._lock = threading.RLock()
         self._process: subprocess.Popen[Any] | None = None
-        self._reader: TextIO | None = None
-        self._writer: TextIO | None = None
+        self._reader: IO[str] | None = None
+        self._writer: IO[str] | None = None
         self._current_capture: str | None = None
         self._current_capture_token: tuple[int, int] | None = None
         self.renderdoc_version: str | None = None
-        atexit.register(self.close)
 
     # -- public API (satisfies RenderDocBridge Protocol) ---------------------
 
     def ensure_capture_loaded(self, capture_path: str) -> dict[str, Any]:
         path = Path(capture_path)
         normalized = str(path)
-        stat_result = path.stat()
+        try:
+            stat_result = path.stat()
+        except OSError as exc:
+            raise CapturePathError(normalized) from exc
         capture_token = (
             int(stat_result.st_size),
             int(getattr(stat_result, "st_mtime_ns", int(stat_result.st_mtime * 1_000_000_000))),

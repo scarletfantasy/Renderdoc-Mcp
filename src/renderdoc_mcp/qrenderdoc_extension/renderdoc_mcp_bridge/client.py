@@ -1,5 +1,5 @@
 import base64
-from collections import deque
+from collections import OrderedDict, deque
 import json
 import os
 import threading
@@ -52,7 +52,7 @@ from .serialization import (
     _serialize_vulkan_pipeline_state,
     _shader_stage_values,
 )
-from .transport import _WinSockClient, _log
+from .transport import _log
 
 PROTOCOL_VERSION = 1
 CONNECT_RETRY_SECONDS = 20.0
@@ -60,6 +60,7 @@ PROBE_DEFAULT_THRESHOLD = 0.05
 PROBE_MAX_DIMENSION = 128
 PROBE_MAX_PIXELS = 16384
 PROBE_SUPPORTED_CHANNEL_MODES = {"luma", "max_rgb", "alpha", "any"}
+MAX_SHADER_CODE_CACHE_ENTRIES = 64
 
 _bridge = None
 _METHOD_UNAVAILABLE = object()
@@ -113,10 +114,6 @@ def _subresource(mip_level, array_slice, sample):
     sub.slice = int(array_slice)
     sub.sample = int(sample)
     return sub
-
-
-def _resource_id_matches(value, expected):
-    return _resource_id(value) == str(expected)
 
 
 def _safe_float(value):
@@ -480,7 +477,8 @@ class BridgeClient(object):
         self.thread = None
         self.analysis_cache = frame_analysis.AnalysisCache()
         self.timing_cache = frame_analysis.AnalysisCache()
-        self.shader_code_cache = {}
+        self.resource_catalog_cache = frame_analysis.AnalysisCache()
+        self.shader_code_cache = OrderedDict()
         self.shader_debug_sessions = {}
         self.runtime = BridgeRuntime(self)
         self.capture_ops = CaptureOps(self)
@@ -531,93 +529,6 @@ class BridgeClient(object):
             handlers.update(ops.handlers())
         return handlers
 
-    def start(self):
-        host = os.environ.get("RENDERDOC_MCP_BRIDGE_HOST")
-        port = os.environ.get("RENDERDOC_MCP_BRIDGE_PORT")
-        token = os.environ.get("RENDERDOC_MCP_BRIDGE_TOKEN")
-        protocol = os.environ.get("RENDERDOC_MCP_BRIDGE_PROTOCOL")
-        _log("Bridge start requested host={} port={} protocol={}".format(host, port, protocol))
-
-        if not host or not port or not token:
-            _log("Bridge env vars missing, not connecting.")
-            return False
-
-        if protocol and int(protocol) != PROTOCOL_VERSION:
-            _log("Protocol mismatch: expected {}, got {}".format(PROTOCOL_VERSION, protocol))
-            return False
-
-        deadline = time.time() + CONNECT_RETRY_SECONDS
-
-        while time.time() < deadline and not self.stop_event.is_set():
-            try:
-                sock = _WinSockClient()
-                sock.connect(host, int(port))
-                self.sock = sock
-                self._send(
-                    {
-                        "type": "hello",
-                        "token": token,
-                        "protocol_version": PROTOCOL_VERSION,
-                        "renderdoc_version": self.renderdoc_version or os.environ.get("RENDERDOC_VERSION", ""),
-                    }
-                )
-                _log("Bridge connected and hello sent.")
-                self.thread = threading.Thread(target=self._run, name="renderdoc_mcp_bridge", daemon=True)
-                self.thread.start()
-                return True
-            except Exception:
-                _log("Bridge connection attempt failed:\n{}".format(traceback.format_exc()))
-                time.sleep(0.25)
-
-        _log("Bridge failed to connect before timeout.")
-        return False
-
-    def stop(self):
-        self.stop_event.set()
-        if self.thread is not None:
-            if threading.current_thread() is not self.thread:
-                self.thread.join(timeout=2.0)
-            self.thread = None
-        if self.sock is not None:
-            try:
-                self.sock.close()
-            except Exception:
-                pass
-            self.sock = None
-        self._clear_analysis_cache()
-
-    def _send(self, message):
-        self.sock.send_text(json.dumps(message, separators=(",", ":")) + "\n")
-
-    def _read(self):
-        return json.loads(self.sock.recv_line())
-
-    def _invoke_on_ui_thread(self, callback):
-        done = threading.Event()
-        result = {}
-
-        def runner():
-            try:
-                result["value"] = callback()
-            except BridgeError as exc:
-                result["error"] = exc.to_payload()
-            except Exception:
-                result["error"] = {
-                    "code": "replay_failure",
-                    "message": "RenderDoc request failed.",
-                    "details": {"traceback": traceback.format_exc()},
-                }
-            finally:
-                done.set()
-
-        self.mqt.InvokeOntoUIThread(runner)
-        done.wait()
-
-        if "error" in result:
-            raise BridgeError.from_payload(result["error"])
-
-        return result.get("value", {})
-
     def _block_invoke_checked(self, callback):
         callback_error = {}
 
@@ -661,6 +572,7 @@ class BridgeClient(object):
     def _clear_analysis_cache(self):
         self.analysis_cache.clear()
         self.timing_cache.clear()
+        self.resource_catalog_cache.clear()
         self.shader_code_cache.clear()
         self._clear_shader_debug_sessions()
 
@@ -856,23 +768,57 @@ class BridgeClient(object):
         self.ctx.Replay().BlockInvoke(callback)
         return self.analysis_cache.store(cache_key, payload["value"])
 
-    def _analysis_max_event_id(self, nodes):
-        maximum = 0
-        for node in nodes:
-            maximum = max(maximum, int(node.get("event_id", 0)), self._analysis_max_event_id(node.get("children", [])))
-        return maximum
-
     def _ensure_final_event(self):
         analysis = self._ensure_frame_analysis()
-        event_id = self._analysis_max_event_id(analysis.get("action_tree", []))
+        event_id = int(analysis.get("max_event_id", 0))
         if event_id > 0:
             self._set_event(event_id)
         return analysis
 
+    def _ensure_resource_catalog(self):
+        self._ensure_capture_loaded()
+        cache_key = self._capture_cache_key()
+        cached = self.resource_catalog_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        textures = list(self.ctx.GetTextures() or [])
+        buffers = list(self.ctx.GetBuffers() or [])
+        compact_textures = [self._compact_texture(texture) for texture in textures]
+        compact_buffers = [self._compact_buffer(buffer_desc) for buffer_desc in buffers]
+        by_id = {}
+        for texture in textures:
+            by_id[_resource_id(texture.resourceId)] = ("texture", texture)
+        for buffer_desc in buffers:
+            by_id[_resource_id(buffer_desc.resourceId)] = ("buffer", buffer_desc)
+
+        items_by_kind = {
+            "textures": compact_textures,
+            "buffers": compact_buffers,
+            "all": compact_textures + compact_buffers,
+        }
+        sorted_items = {}
+        for kind, items in items_by_kind.items():
+            for sort_by in ("name", "size"):
+                sorted_items[(kind, sort_by)] = sorted(
+                    items,
+                    key=lambda item, selected_sort=sort_by: self._resource_sort_key(item, selected_sort),
+                )
+
+        return self.resource_catalog_cache.store(
+            cache_key,
+            {
+                "textures": textures,
+                "buffers": buffers,
+                "by_id": by_id,
+                "sorted_items": sorted_items,
+            },
+        )
+
     def _find_texture_by_id(self, texture_id):
-        for texture in self.ctx.GetTextures():
-            if _resource_id_matches(texture.resourceId, texture_id):
-                return texture
+        resource = self._ensure_resource_catalog()["by_id"].get(str(texture_id))
+        if resource is not None and resource[0] == "texture":
+            return resource[1]
         raise RuntimeError(
             json.dumps(
                 {
@@ -884,9 +830,9 @@ class BridgeClient(object):
         )
 
     def _find_buffer_by_id(self, buffer_id):
-        for buffer_desc in self.ctx.GetBuffers():
-            if _resource_id_matches(buffer_desc.resourceId, buffer_id):
-                return buffer_desc
+        resource = self._ensure_resource_catalog()["by_id"].get(str(buffer_id))
+        if resource is not None and resource[0] == "buffer":
+            return resource[1]
         raise RuntimeError(
             json.dumps(
                 {
@@ -947,19 +893,10 @@ class BridgeClient(object):
         ]
 
     def _list_resource_items(self, kind, name_filter, sort_by):
-        self._ensure_capture_loaded()
         name_filter_lower = (str(name_filter or "").strip().lower()) or None
-
-        def matches(item_name):
-            return not name_filter_lower or name_filter_lower in item_name.lower()
-
-        items = []
-        if kind in ("all", "textures"):
-            items.extend([self._compact_texture(tex) for tex in self.ctx.GetTextures()])
-        if kind in ("all", "buffers"):
-            items.extend([self._compact_buffer(buf) for buf in self.ctx.GetBuffers()])
-        items = [item for item in items if matches(item["name"])]
-        items.sort(key=lambda item: self._resource_sort_key(item, sort_by))
+        items = list(self._ensure_resource_catalog()["sorted_items"][(kind, sort_by)])
+        if name_filter_lower:
+            items = [item for item in items if name_filter_lower in item["name"].lower()]
         return items
 
     def _compact_shader_binding(self, shader_payload):
@@ -1638,7 +1575,7 @@ class BridgeClient(object):
         start_line = max(1, int(start_line or 1))
         line_count = max(1, int(line_count or 200))
         cache_key = (int(event_id), str(stage_name), str(target or "").lower())
-        cached = self.shader_code_cache.get(cache_key)
+        cached = self._shader_code_cache_get(cache_key)
 
         if cached is None:
             shader_payload = self._get_shader_code(event_id, stage_name, target)
@@ -1661,8 +1598,8 @@ class BridgeClient(object):
                 "available_targets": list(disassembly.get("available_targets", [])),
                 "lines": text.splitlines(),
             }
-            self.shader_code_cache[actual_key] = cached
-            self.shader_code_cache[cache_key] = cached
+            self._shader_code_cache_store(actual_key, cached)
+            self._shader_code_cache_store(cache_key, cached)
 
         if not cached["available"]:
             return {
@@ -1701,6 +1638,18 @@ class BridgeClient(object):
             "has_more": (offset + returned_line_count) < total_lines,
             "text": "\n".join(chunk),
         }
+
+    def _shader_code_cache_get(self, cache_key):
+        cached = self.shader_code_cache.get(cache_key)
+        if cached is not None:
+            self.shader_code_cache.move_to_end(cache_key)
+        return cached
+
+    def _shader_code_cache_store(self, cache_key, value):
+        self.shader_code_cache[cache_key] = value
+        self.shader_code_cache.move_to_end(cache_key)
+        while len(self.shader_code_cache) > MAX_SHADER_CODE_CACHE_ENTRIES:
+            self.shader_code_cache.popitem(last=False)
 
     def _get_pipeline_state(self, event_id):
         self._ensure_capture_loaded()
@@ -3303,15 +3252,9 @@ class BridgeClient(object):
         }
 
     def _resource_usage_target(self, resource_id):
-        self._ensure_capture_loaded()
-
-        for texture in self.ctx.GetTextures():
-            if _resource_id_matches(texture.resourceId, resource_id):
-                return ("texture", texture)
-
-        for buffer_desc in self.ctx.GetBuffers():
-            if _resource_id_matches(buffer_desc.resourceId, resource_id):
-                return ("buffer", buffer_desc)
+        resource = self._ensure_resource_catalog()["by_id"].get(str(resource_id))
+        if resource is not None:
+            return resource
 
         raise BridgeError(
             "invalid_resource_id",
@@ -3366,54 +3309,6 @@ class BridgeClient(object):
             self._clear_analysis_cache()
             self.ctx.CloseCapture()
         return {"closed": True, "meta": {}}
-
-    def _dispatch(self, method, params):
-        handler = self.handlers.get(method)
-        if handler is None:
-            raise BridgeError("replay_failure", "Unknown bridge method.", {"method": method})
-        return handler(params or {})
-
-    def _run(self):
-        while not self.stop_event.is_set():
-            try:
-                request = self._read()
-            except TimeoutError:
-                continue
-            except Exception:
-                _log("Bridge read failed, stopping loop:\n{}".format(traceback.format_exc()))
-                break
-
-            request_id = request.get("id")
-            try:
-                result = self._invoke_on_ui_thread(lambda: self._dispatch(request.get("method", ""), request.get("params", {})))
-                response = {"type": "response", "id": request_id, "result": result}
-            except Exception as exc:
-                response = {"type": "response", "id": request_id, "error": self._parse_exception(exc)}
-
-            try:
-                self._send(response)
-            except Exception:
-                _log("Bridge write failed, stopping loop:\n{}".format(traceback.format_exc()))
-                break
-
-        self.stop()
-
-    def _parse_exception(self, exc):
-        if isinstance(exc, BridgeError):
-            return exc.to_payload()
-        try:
-            payload = json.loads(str(exc))
-            if isinstance(payload, dict) and "message" in payload:
-                return payload
-        except Exception:
-            pass
-
-        return {
-            "code": "replay_failure",
-            "message": str(exc),
-            "details": {"traceback": traceback.format_exc()},
-        }
-
 
 def register(version, ctx):
     global _bridge

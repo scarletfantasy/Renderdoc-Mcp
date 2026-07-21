@@ -1,24 +1,45 @@
 [build-system]
-requires = ["setuptools>=69", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "renderdoc-mcp"
-version = "0.1.0"
+dynamic = ["version"]
 description = "A Windows-first MCP server for inspecting RenderDoc captures."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+  { name = "scarletfantasy" },
+]
+keywords = ["mcp", "renderdoc", "graphics", "gpu", "debugging"]
 classifiers = [
-  "License :: OSI Approved :: MIT License",
+  "Development Status :: 3 - Alpha",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Software Development :: Debuggers",
 ]
 dependencies = [
   "mcp>=1.26.0,<2.0.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/scarletfantasy/renderdoc-mcp"
+Issues = "https://github.com/scarletfantasy/renderdoc-mcp/issues"
+Repository = "https://github.com/scarletfantasy/renderdoc-mcp.git"
+
 [dependency-groups]
 dev = [
+  "mypy>=1.17.0,<2.0.0",
   "pytest>=9.0.0,<10.0.0",
+  "pytest-cov>=6.0.0,<8.0.0",
+  "ruff>=0.12.0,<1.0.0",
 ]
 
 [project.scripts]
@@ -33,9 +54,11 @@ include-package-data = true
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.dynamic]
+version = { attr = "renderdoc_mcp.__version__" }
+
 [tool.setuptools.package-data]
 renderdoc_mcp = [
-  "qrenderdoc_extension/renderdoc_mcp_bridge/__init__.py",
   "qrenderdoc_extension/renderdoc_mcp_bridge/extension.json",
 ]
 
@@ -49,3 +72,37 @@ norecursedirs = [".pytest_tmp", "pytest-cache-files-*"]
 markers = [
   "integration: requires local RenderDoc and a replayable .rdc capture",
 ]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["B", "E4", "E7", "E9", "F", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/renderdoc_mcp/qrenderdoc_extension/**" = ["B", "E4", "E7", "F", "I"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["src/renderdoc_mcp"]
+exclude = "qrenderdoc_extension"
+check_untyped_defs = true
+ignore_missing_imports = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+module = ["renderdoc_mcp.qrenderdoc_extension.*"]
+ignore_errors = true
+
+[tool.coverage.run]
+branch = true
+source = ["renderdoc_mcp"]
+omit = ["src/renderdoc_mcp/qrenderdoc_extension/*"]
+
+[tool.coverage.report]
+fail_under = 65
+show_missing = true
+skip_covered = true

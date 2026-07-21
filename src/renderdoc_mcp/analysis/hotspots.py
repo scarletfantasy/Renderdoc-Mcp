@@ -1,6 +1,6 @@
 from .models import HOTSPOT_LIMIT, with_meta
 from .pass_classification import index_action_nodes, pass_summary
-from .timing import normalize_timing_payload, timed_event_entry, timing_info_from_payload
+from .timing import normalize_timing_payload, timed_event_entry, timing_info_from_payload, timing_range_summary
 
 
 def build_performance_hotspots(
@@ -9,8 +9,10 @@ def build_performance_hotspots(
     limit=HOTSPOT_LIMIT,
 ):
     limit = int(limit or HOTSPOT_LIMIT)
-    action_index = {}
-    index_action_nodes(analysis_cache["action_tree"], action_index)
+    action_index = analysis_cache.get("action_index")
+    if action_index is None:
+        action_index = {}
+        index_action_nodes(analysis_cache["action_tree"], action_index)
     normalized_timing = normalize_timing_payload(timing_payload)
     timing_info = timing_info_from_payload(normalized_timing)
     candidate_passes = _hotspot_pass_candidates(analysis_cache)
@@ -19,28 +21,27 @@ def build_performance_hotspots(
         "basis": "gpu_timing" if timing_info.timing_available else "heuristic",
         "top_passes": [],
         "top_events": [],
-    }
+    }  # type: dict[str, object]
 
     if timing_info.timing_available:
         pass_rankings = []
         for pass_payload in candidate_passes:
             start_event_id = int(pass_payload["event_range"]["start_event_id"])
             end_event_id = int(pass_payload["event_range"]["end_event_id"])
-            rows = [
-                item
-                for item in normalized_timing.get("rows", [])
-                if start_event_id <= int(item["event_id"]) <= end_event_id
-            ]
-            if not rows:
+            total_gpu_time_ms, timed_event_count = timing_range_summary(
+                normalized_timing,
+                start_event_id,
+                end_event_id,
+            )
+            if not timed_event_count:
                 continue
 
-            total_gpu_time_ms = round(sum(float(item["gpu_time_ms"]) for item in rows), 6)
             pass_rankings.append(
                 {
                     "metric_name": "gpu_time_ms",
                     "metric_value": total_gpu_time_ms,
                     "gpu_time_ms": total_gpu_time_ms,
-                    "timed_event_count": len(rows),
+                    "timed_event_count": timed_event_count,
                     **pass_summary(pass_payload),
                 }
             )

@@ -21,8 +21,8 @@ from .models import (
 from .pass_classification import (
     action_summary,
     build_frame_analysis,
-    get_innermost_pass_for_event,
     compact_action_entry,
+    get_innermost_pass_for_event,
     get_pass_details,
     get_pass_summary,
     pass_id_from_range,
@@ -30,7 +30,7 @@ from .pass_classification import (
     pass_summary,
 )
 from .resource_usage import RESOURCE_USAGE_KINDS, build_resource_usage_overview, list_resource_usages
-from .timing import build_analysis_result, build_timing_result, list_passes, list_timing_events
+from .timing import build_analysis_result, build_timing_result, list_passes, list_timing_events, timing_range_summary
 
 __all__ = [
     "AnalysisCache",
@@ -62,6 +62,7 @@ __all__ = [
     "list_resource_usages",
     "list_passes",
     "list_timing_events",
+    "timing_range_summary",
     "pass_list_entry",
     "pass_id_from_range",
     "pass_summary",

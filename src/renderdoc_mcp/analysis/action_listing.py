@@ -10,7 +10,7 @@ from .pass_classification import action_summary, compact_action_entry
 def build_action_tree_result(nodes, total_count, max_depth=None, name_filter=None, limit=None):
     name_filter_lower = _lower(name_filter)
     filtered = _filter_action_tree(nodes, max_depth, name_filter_lower, 0)
-    flat = []
+    flat = []  # type: list[dict]
     _flatten_action_tree(filtered, flat)
 
     preview_limit = int(limit if limit is not None else LEGACY_ACTION_LIST_NODE_LIMIT)
@@ -38,7 +38,7 @@ def build_action_tree_result(nodes, total_count, max_depth=None, name_filter=Non
 def build_action_list_result(nodes, total_count, max_depth=None, name_filter=None, cursor=None, limit=None):
     name_filter_lower = _lower(name_filter)
     filtered = _filter_action_tree(nodes, max_depth, name_filter_lower, 0)
-    flat = []
+    flat = []  # type: list[dict]
     _flatten_action_tree(filtered, flat)
 
     page_limit = int(limit if limit is not None else DEFAULT_ACTION_PAGE_LIMIT)
@@ -69,7 +69,7 @@ def filter_action_tree(nodes, max_depth=None, name_filter=None):
 
 
 def flatten_action_tree(nodes):
-    flat = []
+    flat = []  # type: list[dict]
     _flatten_action_tree(nodes, flat)
     return flat
 

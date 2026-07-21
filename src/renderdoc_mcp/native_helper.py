@@ -61,11 +61,12 @@ def _iter_dll_search_dirs(module_dir: str, dll_dir: str) -> list[str]:
     return ordered
 
 
-def _configure_renderdoc_paths(module_dir: str, dll_dir: str) -> None:
+def _configure_renderdoc_paths(module_dir: str, dll_dir: str) -> list[Any]:
     if module_dir and module_dir not in sys.path:
         sys.path.insert(0, module_dir)
 
     discovered_dirs = _iter_dll_search_dirs(module_dir, dll_dir)
+    dll_directory_handles: list[Any] = []
     if discovered_dirs:
         existing_path = os.environ.get("PATH", "")
         path_entries = list(discovered_dirs)
@@ -75,7 +76,8 @@ def _configure_renderdoc_paths(module_dir: str, dll_dir: str) -> None:
         add_dll_directory = getattr(os, "add_dll_directory", None)
         if callable(add_dll_directory):
             for path in discovered_dirs:
-                add_dll_directory(path)
+                dll_directory_handles.append(add_dll_directory(path))
+    return dll_directory_handles
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
@@ -87,7 +89,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(list(argv or sys.argv[1:]))
-    _configure_renderdoc_paths(args.module_dir, args.dll_dir)
+    dll_directory_handles = _configure_renderdoc_paths(args.module_dir, args.dll_dir)
 
     try:
         import renderdoc as rd
@@ -168,11 +170,18 @@ def main(argv: list[str] | None = None) -> int:
         try:
             context.CloseCapture()
         finally:
-            if initialized:
-                try:
-                    rd.ShutdownReplay()
-                except Exception:
-                    pass
+            try:
+                if initialized:
+                    try:
+                        rd.ShutdownReplay()
+                    except Exception:
+                        pass
+            finally:
+                for handle in reversed(dll_directory_handles):
+                    try:
+                        handle.close()
+                    except Exception:
+                        pass
 
     return 0
 

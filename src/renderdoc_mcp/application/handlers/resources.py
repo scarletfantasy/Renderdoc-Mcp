@@ -287,7 +287,7 @@ class ResourceHandlers:
         view: int | str | None = None,
         state_limit: int | str | None = None,
     ) -> dict[str, Any]:
-        params = {
+        params: dict[str, Any] = {
             "event_id": self.context.normalize_required_int(event_id, "event_id"),
             "x": self.context.normalize_non_negative_int(x, "x"),
             "y": self.context.normalize_non_negative_int(y, "y"),
@@ -322,7 +322,7 @@ class ResourceHandlers:
         thread_z: int = 0,
         state_limit: int | str | None = None,
     ) -> dict[str, Any]:
-        params = {
+        params: dict[str, Any] = {
             "event_id": self.context.normalize_required_int(event_id, "event_id"),
             "group_id": [
                 self.context.normalize_non_negative_int(group_x, "group_x"),
@@ -385,7 +385,7 @@ class ResourceHandlers:
         array_slice: int = 0,
         sample: int = 0,
     ) -> dict[str, Any]:
-        params = {
+        params: dict[str, Any] = {
             "texture_id": self.context.normalize_required_string(texture_id, "texture_id"),
             "mip_level": self.context.normalize_non_negative_int(mip_level, "mip_level"),
             "x": self.context.normalize_non_negative_int(x, "x"),
@@ -425,10 +425,15 @@ class ResourceHandlers:
     ) -> dict[str, Any]:
         normalized_size = self.context.normalize_optional_int(size, "size")
         normalized_encoding = (self.context.normalize_optional_string(encoding) or "hex").lower()
-        params = {
+        if normalized_size is not None and normalized_size <= 0:
+            raise ReplayFailureError(
+                "size must be greater than 0.",
+                {"size": normalized_size},
+            )
+        params: dict[str, Any] = {
             "buffer_id": self.context.normalize_required_string(buffer_id, "buffer_id"),
             "offset": self.context.normalize_non_negative_int(offset, "offset"),
-            "size": normalized_size or DEFAULT_BUFFER_READ_SIZE,
+            "size": DEFAULT_BUFFER_READ_SIZE if normalized_size is None else normalized_size,
             "encoding": normalized_encoding,
         }
 
@@ -475,11 +480,11 @@ class ResourceHandlers:
     def _normalize_pixel_params(
         self,
         texture_id: str,
-        x: int,
-        y: int,
-        mip_level: int | None,
-        array_slice: int | None,
-        sample: int | None,
+        x: Any,
+        y: Any,
+        mip_level: Any,
+        array_slice: Any,
+        sample: Any,
     ) -> dict[str, Any]:
         return {
             "texture_id": self.context.normalize_required_string(texture_id, "texture_id"),
@@ -499,7 +504,8 @@ class ResourceHandlers:
         return normalized
 
     def _normalize_state_limit(self, value: Any) -> int:
-        normalized = self.context.normalize_optional_int(value, "state_limit") or DEFAULT_SHADER_DEBUG_STATE_LIMIT
+        normalized_value = self.context.normalize_optional_int(value, "state_limit")
+        normalized = DEFAULT_SHADER_DEBUG_STATE_LIMIT if normalized_value is None else normalized_value
         if normalized <= 0 or normalized > MAX_SHADER_DEBUG_STATE_LIMIT:
             raise ReplayFailureError(
                 "state_limit must be between 1 and {}.".format(MAX_SHADER_DEBUG_STATE_LIMIT),
@@ -508,7 +514,8 @@ class ResourceHandlers:
         return normalized
 
     def _normalize_change_limit(self, value: Any) -> int:
-        normalized = self.context.normalize_optional_int(value, "change_limit") or DEFAULT_SHADER_DEBUG_CHANGE_LIMIT
+        normalized_value = self.context.normalize_optional_int(value, "change_limit")
+        normalized = DEFAULT_SHADER_DEBUG_CHANGE_LIMIT if normalized_value is None else normalized_value
         if normalized <= 0 or normalized > MAX_SHADER_DEBUG_CHANGE_LIMIT:
             raise ReplayFailureError(
                 "change_limit must be between 1 and {}.".format(MAX_SHADER_DEBUG_CHANGE_LIMIT),

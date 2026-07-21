@@ -29,14 +29,14 @@ class CaptureHandlers:
 
     def renderdoc_open_capture(self, capture_path: str) -> dict[str, Any]:
         command = OpenCaptureCommand.from_raw(self.context.normalizer, capture_path)
-        session = self.context.sessions.open_normalized_capture(command.capture_path)
-        try:
-            session.bridge.ensure_capture_loaded(session.capture_path)
-            overview = ensure_meta(session.bridge.call("get_capture_overview"))
-        except Exception:
-            self.context.sessions.close_normalized_capture(session.capture_id)
-            raise
-        return attach_capture(overview, session)
+        with self.context.sessions.open_normalized_capture_lease(command.capture_path) as session:
+            try:
+                session.bridge.ensure_capture_loaded(session.capture_path)
+                overview = ensure_meta(session.bridge.call("get_capture_overview"))
+            except Exception:
+                self.context.sessions.close_normalized_capture(session.capture_id)
+                raise
+            return attach_capture(overview, session)
 
     def renderdoc_close_capture(self, capture_id: str) -> dict[str, Any]:
         session = self.context.get_session(capture_id)

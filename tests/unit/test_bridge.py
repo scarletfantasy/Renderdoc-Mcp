@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import gc
+import weakref
 from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,8 +9,8 @@ from types import SimpleNamespace
 import pytest
 
 from renderdoc_mcp import bridge as bridge_module
-from renderdoc_mcp.errors import BridgeHandshakeTimeoutError
 from renderdoc_mcp.bridge import QRenderDocBridge
+from renderdoc_mcp.errors import BridgeHandshakeTimeoutError, ReplayFailureError
 from renderdoc_mcp.qrenderdoc_extension.renderdoc_mcp_bridge import client as bridge_client_module
 from renderdoc_mcp.qrenderdoc_extension.renderdoc_mcp_bridge import serialization as serialization_module
 from renderdoc_mcp.qrenderdoc_extension.renderdoc_mcp_bridge.client import BridgeClient
@@ -223,9 +225,33 @@ def _shader_variable(name: str, values: list[float], type_name: str = "Float") -
 def test_qrenderdoc_bridge_records_renderdoc_version_from_hello() -> None:
     bridge = QRenderDocBridge(timeout_seconds=1.0)
 
-    bridge._accept_hello({"type": "hello", "token": "token", "renderdoc_version": "1.43"}, "token")
+    bridge._accept_hello(
+        {"type": "hello", "token": "token", "protocol_version": 1, "renderdoc_version": "1.43"},
+        "token",
+    )
 
     assert bridge.renderdoc_version == "1.43"
+
+
+def test_qrenderdoc_bridge_rejects_protocol_mismatch() -> None:
+    bridge = QRenderDocBridge(timeout_seconds=1.0)
+
+    with pytest.raises(ReplayFailureError):
+        bridge._accept_hello(
+            {"type": "hello", "token": "token", "protocol_version": 999, "renderdoc_version": "1.43"},
+            "token",
+        )
+
+
+def test_closed_bridge_is_not_retained_by_process_exit_callbacks() -> None:
+    bridge = QRenderDocBridge(timeout_seconds=1.0)
+    reference = weakref.ref(bridge)
+
+    bridge.close()
+    del bridge
+    gc.collect()
+
+    assert reference() is None
 
 
 def test_qrenderdoc_bridge_timeout_does_not_shell_out_to_kill_external_processes(monkeypatch) -> None:

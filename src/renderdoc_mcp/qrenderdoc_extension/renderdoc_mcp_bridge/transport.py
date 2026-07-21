@@ -2,6 +2,9 @@ import ctypes
 import os
 import time
 
+MAX_MESSAGE_BYTES = 8 * 1024 * 1024
+MAX_LOG_BYTES = 1024 * 1024
+
 _LOG_PATH = os.environ.get("RENDERDOC_MCP_BRIDGE_LOG")
 if not _LOG_PATH:
     _LOG_PATH = os.path.join(os.environ.get("TEMP", os.environ.get("TMP", ".")), "renderdoc_mcp_bridge_default.log")
@@ -11,22 +14,34 @@ def _log(message):
     if not _LOG_PATH:
         return
     try:
-        with open(_LOG_PATH, "a") as handle:
+        mode = "w" if os.path.isfile(_LOG_PATH) and os.path.getsize(_LOG_PATH) >= MAX_LOG_BYTES else "a"
+        with open(_LOG_PATH, mode) as handle:
             handle.write("[{}] {}\n".format(time.strftime("%Y-%m-%d %H:%M:%S"), message))
     except Exception:
         pass
 
 
 class _WSADATA(ctypes.Structure):
-    _fields_ = [
-        ("wVersion", ctypes.c_ushort),
-        ("wHighVersion", ctypes.c_ushort),
-        ("szDescription", ctypes.c_char * 257),
-        ("szSystemStatus", ctypes.c_char * 129),
-        ("iMaxSockets", ctypes.c_ushort),
-        ("iMaxUdpDg", ctypes.c_ushort),
-        ("lpVendorInfo", ctypes.c_void_p),
-    ]
+    if ctypes.sizeof(ctypes.c_void_p) == 8:
+        _fields_ = [
+            ("wVersion", ctypes.c_ushort),
+            ("wHighVersion", ctypes.c_ushort),
+            ("iMaxSockets", ctypes.c_ushort),
+            ("iMaxUdpDg", ctypes.c_ushort),
+            ("lpVendorInfo", ctypes.c_void_p),
+            ("szDescription", ctypes.c_char * 257),
+            ("szSystemStatus", ctypes.c_char * 129),
+        ]
+    else:
+        _fields_ = [
+            ("wVersion", ctypes.c_ushort),
+            ("wHighVersion", ctypes.c_ushort),
+            ("szDescription", ctypes.c_char * 257),
+            ("szSystemStatus", ctypes.c_char * 129),
+            ("iMaxSockets", ctypes.c_ushort),
+            ("iMaxUdpDg", ctypes.c_ushort),
+            ("lpVendorInfo", ctypes.c_void_p),
+        ]
 
 
 class _SockAddrIn(ctypes.Structure):
@@ -52,6 +67,26 @@ class _WinSockClient(object):
 
     _started = False
     _ws2_32 = ctypes.WinDLL("Ws2_32.dll")
+    _socket_type = ctypes.c_size_t
+
+    _ws2_32.WSAStartup.argtypes = [ctypes.c_ushort, ctypes.POINTER(_WSADATA)]
+    _ws2_32.WSAStartup.restype = ctypes.c_int
+    _ws2_32.WSAGetLastError.argtypes = []
+    _ws2_32.WSAGetLastError.restype = ctypes.c_int
+    _ws2_32.socket.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
+    _ws2_32.socket.restype = _socket_type
+    _ws2_32.setsockopt.argtypes = [_socket_type, ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+    _ws2_32.setsockopt.restype = ctypes.c_int
+    _ws2_32.inet_addr.argtypes = [ctypes.c_char_p]
+    _ws2_32.inet_addr.restype = ctypes.c_uint32
+    _ws2_32.connect.argtypes = [_socket_type, ctypes.c_void_p, ctypes.c_int]
+    _ws2_32.connect.restype = ctypes.c_int
+    _ws2_32.send.argtypes = [_socket_type, ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+    _ws2_32.send.restype = ctypes.c_int
+    _ws2_32.recv.argtypes = [_socket_type, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+    _ws2_32.recv.restype = ctypes.c_int
+    _ws2_32.closesocket.argtypes = [_socket_type]
+    _ws2_32.closesocket.restype = ctypes.c_int
 
     @classmethod
     def _startup(cls):
@@ -69,18 +104,34 @@ class _WinSockClient(object):
 
     def __init__(self):
         self._startup()
-        self.sock = ctypes.c_size_t(self.INVALID_SOCKET)
+        self.sock = self.INVALID_SOCKET
         self._buffer = b""
 
     def connect(self, host, port):
-        self.sock = ctypes.c_size_t(self._ws2_32.socket(self.AF_INET, self.SOCK_STREAM, self.IPPROTO_TCP))
-        if self.sock.value == self.INVALID_SOCKET:
+        self.sock = int(self._ws2_32.socket(self.AF_INET, self.SOCK_STREAM, self.IPPROTO_TCP))
+        if self.sock == self.INVALID_SOCKET:
             raise RuntimeError("socket() failed: {}".format(self._last_error()))
 
         timeout_ms = ctypes.c_int(250)
         timeout_size = ctypes.c_int(ctypes.sizeof(timeout_ms))
-        self._ws2_32.setsockopt(self.sock, self.SOL_SOCKET, self.SO_RCVTIMEO, ctypes.byref(timeout_ms), timeout_size)
-        self._ws2_32.setsockopt(self.sock, self.SOL_SOCKET, self.SO_SNDTIMEO, ctypes.byref(timeout_ms), timeout_size)
+        recv_timeout_result = self._ws2_32.setsockopt(
+            self.sock,
+            self.SOL_SOCKET,
+            self.SO_RCVTIMEO,
+            ctypes.byref(timeout_ms),
+            timeout_size,
+        )
+        send_timeout_result = self._ws2_32.setsockopt(
+            self.sock,
+            self.SOL_SOCKET,
+            self.SO_SNDTIMEO,
+            ctypes.byref(timeout_ms),
+            timeout_size,
+        )
+        if recv_timeout_result == self.SOCKET_ERROR or send_timeout_result == self.SOCKET_ERROR:
+            error = self._last_error()
+            self.close()
+            raise RuntimeError("setsockopt() failed: {}".format(error))
 
         addr = _SockAddrIn()
         addr.sin_family = self.AF_INET
@@ -96,6 +147,8 @@ class _WinSockClient(object):
 
     def send_text(self, text):
         payload = text.encode("utf-8")
+        if len(payload) > MAX_MESSAGE_BYTES:
+            raise RuntimeError("Bridge message exceeded the maximum supported size")
         total = 0
         while total < len(payload):
             chunk = payload[total:]
@@ -105,6 +158,8 @@ class _WinSockClient(object):
                 if error in (self.WSAETIMEDOUT, self.WSAEWOULDBLOCK):
                     raise TimeoutError("send() timed out")
                 raise RuntimeError("send() failed: {}".format(error))
+            if result <= 0:
+                raise RuntimeError("send() returned no progress")
             total += int(result)
 
     def recv_line(self):
@@ -125,8 +180,10 @@ class _WinSockClient(object):
                     raise TimeoutError("recv() timed out")
                 raise RuntimeError("recv() failed: {}".format(error))
             self._buffer += chunk.raw[: int(result)]
+            if len(self._buffer) > MAX_MESSAGE_BYTES:
+                raise RuntimeError("Bridge message exceeded the maximum supported size")
 
     def close(self):
-        if self.sock.value != self.INVALID_SOCKET:
+        if self.sock != self.INVALID_SOCKET:
             self._ws2_32.closesocket(self.sock)
-            self.sock = ctypes.c_size_t(self.INVALID_SOCKET)
+            self.sock = self.INVALID_SOCKET

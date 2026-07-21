@@ -20,17 +20,24 @@ class BridgeRuntime(BridgeComponent):
             _log("Bridge env vars missing, not connecting.")
             return False
 
-        if protocol and int(protocol) != self.PROTOCOL_VERSION:
-            _log("Protocol mismatch: expected {}, got {}".format(self.PROTOCOL_VERSION, protocol))
-            return False
+        if protocol:
+            try:
+                protocol_version = int(protocol)
+            except (TypeError, ValueError):
+                _log("Invalid bridge protocol value: {}".format(protocol))
+                return False
+            if protocol_version != self.PROTOCOL_VERSION:
+                _log("Protocol mismatch: expected {}, got {}".format(self.PROTOCOL_VERSION, protocol))
+                return False
 
         deadline = time.time() + self.CONNECT_RETRY_SECONDS
 
         while time.time() < deadline and not self.stop_event.is_set():
+            sock = None
             try:
                 sock = _WinSockClient()
                 sock.connect(host, int(port))
-                self.sock = sock
+                self.client.sock = sock
                 self._send(
                     {
                         "type": "hello",
@@ -40,10 +47,17 @@ class BridgeRuntime(BridgeComponent):
                     }
                 )
                 _log("Bridge connected and hello sent.")
-                self.thread = threading.Thread(target=self._run, name="renderdoc_mcp_bridge", daemon=True)
-                self.thread.start()
+                self.client.thread = threading.Thread(target=self._run, name="renderdoc_mcp_bridge", daemon=True)
+                self.client.thread.start()
                 return True
             except Exception:
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+                if self.client.sock is sock:
+                    self.client.sock = None
                 _log("Bridge connection attempt failed:\n{}".format(traceback.format_exc()))
                 time.sleep(0.25)
 
@@ -52,23 +66,27 @@ class BridgeRuntime(BridgeComponent):
 
     def stop(self):
         self.stop_event.set()
-        if self.thread is not None:
-            if threading.current_thread() is not self.thread:
-                self.thread.join(timeout=2.0)
-            self.thread = None
-        if self.sock is not None:
+        thread = self.client.thread
+        self.client.thread = None
+        if thread is not None and threading.current_thread() is not thread:
+            thread.join(timeout=2.0)
+        sock = self.client.sock
+        self.client.sock = None
+        if sock is not None:
             try:
-                self.sock.close()
+                sock.close()
             except Exception:
                 pass
-            self.sock = None
         self._clear_analysis_cache()
 
     def _send(self, message):
         self.sock.send_text(json.dumps(message, separators=(",", ":")) + "\n")
 
     def _read(self):
-        return json.loads(self.sock.recv_line())
+        payload = json.loads(self.sock.recv_line())
+        if not isinstance(payload, dict):
+            raise ValueError("Bridge request must be a JSON object")
+        return payload
 
     def _invoke_on_ui_thread(self, callback):
         done = threading.Event()

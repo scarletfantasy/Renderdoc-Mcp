@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import socket
 from dataclasses import dataclass
-from typing import Any, TextIO
+from typing import IO, Any
 
 BRIDGE_PROTOCOL_VERSION = 1
+MAX_BRIDGE_MESSAGE_CHARS = 8 * 1024 * 1024
 
 
 @dataclass(slots=True)
@@ -35,19 +36,27 @@ def encode_message(message: dict[str, Any]) -> bytes:
 
 
 def decode_message(line: str) -> dict[str, Any]:
-    return json.loads(line)
+    payload = json.loads(line)
+    if not isinstance(payload, dict):
+        raise ValueError("Bridge message must be a JSON object.")
+    return payload
 
 
-def send_message(stream: TextIO, message: dict[str, Any]) -> None:
-    stream.write(json.dumps(message, separators=(",", ":")))
+def send_message(stream: IO[str], message: dict[str, Any]) -> None:
+    encoded = json.dumps(message, separators=(",", ":"))
+    if len(encoded) > MAX_BRIDGE_MESSAGE_CHARS:
+        raise ValueError("Bridge message exceeded the maximum supported size.")
+    stream.write(encoded)
     stream.write("\n")
     stream.flush()
 
 
-def read_message(stream: TextIO) -> dict[str, Any]:
-    line = stream.readline()
+def read_message(stream: IO[str]) -> dict[str, Any]:
+    line = stream.readline(MAX_BRIDGE_MESSAGE_CHARS + 1)
     if not line:
         raise ConnectionError("Bridge stream closed")
+    if len(line) > MAX_BRIDGE_MESSAGE_CHARS:
+        raise ValueError("Bridge message exceeded the maximum supported size.")
     return decode_message(line)
 
 

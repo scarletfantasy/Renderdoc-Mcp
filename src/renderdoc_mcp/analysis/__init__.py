@@ -27,12 +27,13 @@ from .frame_analysis import (
     get_innermost_pass_for_event,
     get_pass_details,
     get_pass_summary,
-    list_resource_usages,
     list_passes,
+    list_resource_usages,
     list_timing_events,
-    pass_list_entry,
     pass_id_from_range,
+    pass_list_entry,
     pass_summary,
+    timing_range_summary,
 )
 
 __all__ = [
@@ -63,6 +64,7 @@ __all__ = [
     "list_resource_usages",
     "list_passes",
     "list_timing_events",
+    "timing_range_summary",
     "get_pass_details",
     "get_pass_summary",
     "pass_list_entry",

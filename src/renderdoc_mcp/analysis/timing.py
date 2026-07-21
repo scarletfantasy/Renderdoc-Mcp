@@ -3,14 +3,12 @@ from bisect import bisect_left, bisect_right
 from .models import (
     DEFAULT_PASS_PAGE_LIMIT,
     DEFAULT_TIMING_EVENT_PAGE_LIMIT,
-    MAX_TIMING_EVENT_PAGE_LIMIT,
     PageInfo,
     TimingInfo,
     with_meta,
 )
 from .pass_classification import (
     copy_pass_entry,
-    get_pass_summary,
     index_action_nodes,
     pass_list_entry,
     pass_summary,
@@ -312,6 +310,13 @@ def timed_pass_summaries(pass_payloads, timing_payload):
         payload.append(summary)
 
     return payload
+
+
+def timing_range_summary(timing_payload, start_event_id, end_event_id):
+    normalized = normalize_timing_payload(timing_payload)
+    if not normalized.get("timing_available"):
+        return 0.0, 0
+    return _timing_range_summary(_timing_index(normalized), start_event_id, end_event_id)
 
 
 def timed_event_entry(item, node):

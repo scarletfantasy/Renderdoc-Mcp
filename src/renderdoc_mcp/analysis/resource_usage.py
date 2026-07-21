@@ -1,6 +1,5 @@
 from .models import DEFAULT_ACTION_PAGE_LIMIT, PageInfo, with_meta
 
-
 RESOURCE_USAGE_KINDS = (
     "color_output",
     "depth_output",
@@ -12,7 +11,7 @@ RESOURCE_USAGE_KINDS = (
 
 
 def build_resource_usage_index(nodes):
-    indexed = {}
+    indexed = {}  # type: dict
     for node in nodes:
         _index_resource_usage_node(node, indexed)
 
@@ -210,7 +209,7 @@ def _copy_resource_usage_row(row):
 
 
 def _copy_binding(binding):
-    payload = {"usage_kind": str(binding.get("usage_kind", ""))}
+    payload = {"usage_kind": str(binding.get("usage_kind", ""))}  # type: dict[str, object]
     slot_kind = str(binding.get("slot_kind", "") or "")
     if slot_kind:
         payload["slot_kind"] = slot_kind

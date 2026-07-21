@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import gc
 import subprocess
 import sys
+import threading
+import time
+import weakref
 from pathlib import Path
 
+from renderdoc_mcp import session_pool as session_pool_module
 from renderdoc_mcp.bridge import QRenderDocBridge
 from renderdoc_mcp.session_pool import CaptureSessionPool
 
@@ -107,6 +112,91 @@ def test_session_pool_keeps_in_use_sessions_during_cleanup(tmp_path: Path) -> No
 
     assert evicted == [session.capture_id]
     assert created[0].closed == 1
+
+
+def test_acquiring_an_expired_session_still_closes_its_bridge(tmp_path: Path) -> None:
+    capture_path = _capture(tmp_path, "expired.rdc")
+    clock = FakeClock()
+    created: list[FakeBridge] = []
+    pool = CaptureSessionPool(
+        idle_timeout_seconds=1.0,
+        bridge_factory=lambda: created.append(FakeBridge()) or created[-1],
+        monotonic=clock,
+    )
+    session = pool.open(capture_path)
+    clock.advance(2.0)
+
+    try:
+        with pool.lease(session.capture_id):
+            pass
+    except KeyError:
+        pass
+
+    assert pool.session_count() == 0
+    assert created[0].closed == 1
+
+
+def test_session_pool_evicts_oldest_idle_session_at_capacity(tmp_path: Path) -> None:
+    clock = FakeClock()
+    created: list[FakeBridge] = []
+    pool = CaptureSessionPool(
+        idle_timeout_seconds=0,
+        max_sessions=2,
+        bridge_factory=lambda: created.append(FakeBridge()) or created[-1],
+        monotonic=clock,
+    )
+    first = pool.open(_capture(tmp_path, "first-capacity.rdc"))
+    clock.advance(1.0)
+    second = pool.open(_capture(tmp_path, "second-capacity.rdc"))
+    clock.advance(1.0)
+    third = pool.open(_capture(tmp_path, "third-capacity.rdc"))
+
+    assert pool.get(first.capture_id) is None
+    assert pool.get(second.capture_id) is not None
+    assert pool.get(third.capture_id) is not None
+    assert created[0].closed == 1
+    assert pool.session_count() == 2
+
+
+def test_session_pool_finalizer_closes_sessions_without_retaining_pool(tmp_path: Path) -> None:
+    created: list[FakeBridge] = []
+    pool = CaptureSessionPool(bridge_factory=lambda: created.append(FakeBridge()) or created[-1])
+    pool.open(_capture(tmp_path, "finalized.rdc"))
+    pool_reference = weakref.ref(pool)
+
+    del pool
+    gc.collect()
+
+    assert pool_reference() is None
+    assert created[0].closed == 1
+
+
+def test_session_pool_janitor_evicts_expired_session(tmp_path: Path) -> None:
+    clock = FakeClock()
+    created: list[FakeBridge] = []
+    pool = CaptureSessionPool(
+        idle_timeout_seconds=1.0,
+        bridge_factory=lambda: created.append(FakeBridge()) or created[-1],
+        monotonic=clock,
+    )
+    session = pool.open(_capture(tmp_path, "janitor.rdc"))
+    clock.advance(2.0)
+    stop_event = threading.Event()
+    worker = threading.Thread(
+        target=session_pool_module._session_pool_janitor,
+        args=(weakref.ref(pool), stop_event, 0.001),
+        daemon=True,
+    )
+    worker.start()
+    deadline = time.monotonic() + 1.0
+    while pool.get(session.capture_id) is not None and time.monotonic() < deadline:
+        time.sleep(0.001)
+    stop_event.set()
+    worker.join(timeout=1.0)
+
+    assert pool.get(session.capture_id) is None
+    assert created[0].closed == 1
+    assert not worker.is_alive()
 
 
 def test_explicit_close_closes_bridge_and_removes_session(tmp_path: Path) -> None:

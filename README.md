@@ -46,6 +46,7 @@ This repository now exposes an AI-first v2 MCP surface:
 - `renderdoc_get_pixel_history`
 - `renderdoc_debug_pixel`
 - `renderdoc_trace_bad_pixel`
+- `renderdoc_probe_texture_regions`
 - `renderdoc_start_pixel_shader_debug`
 - `renderdoc_start_compute_shader_debug`
 - `renderdoc_continue_shader_debug`
@@ -237,6 +238,21 @@ renderdoc_get_buffer_data(
 )
 ```
 
+To locate sparse or unexpectedly active areas before choosing a pixel to debug:
+
+```powershell
+renderdoc_probe_texture_regions(
+  capture_id="<capture_id>",
+  texture_id="ResourceId::123",
+  x=0,
+  y=0,
+  width=256,
+  height=256,
+  channel_mode="any",
+  threshold=0.5
+)
+```
+
 Pixel debugging tools are still available:
 
 ```powershell
@@ -327,6 +343,8 @@ uv run renderdoc-install-extension
 
 The installer always copies the bundled extension into `%APPDATA%\qrenderdoc\extensions\renderdoc_mcp_bridge`.
 
+Installation is serialized across processes and replaces the extension as one complete snapshot. Generated Python caches are excluded, and a modified or incomplete installed snapshot is repaired automatically on the next install.
+
 By default it also ensures that `%APPDATA%\qrenderdoc\UI.config` contains `renderdoc_mcp_bridge` inside `AlwaysLoad_Extensions`.
 
 To install the extension without modifying `UI.config`:
@@ -392,9 +410,24 @@ uv run renderdoc-mcp
 - `RENDERDOC_QRENDERDOC_PATH`: override the default `qrenderdoc.exe` path
 - `RENDERDOC_BRIDGE_TIMEOUT_SECONDS`: handshake timeout for launching the configured backend, default `30`
 - `RENDERDOC_CAPTURE_SESSION_IDLE_SECONDS`: idle timeout for per-capture sessions, default `300`; set to `0` or a negative value to disable idle eviction
+- `RENDERDOC_CAPTURE_MAX_SESSIONS`: maximum retained capture sessions, default `8`; least-recently-used idle sessions are closed first, and `0` or a negative value disables the limit
 - `RENDERDOC_NATIVE_MODULE_DIR`: directory containing a standalone source-built `renderdoc.pyd` when `RENDERDOC_BACKEND=native_python`
 - `RENDERDOC_NATIVE_PYTHON_EXE`: Python executable used for the helper process in `native_python` mode; defaults to the current Python executable
 - `RENDERDOC_NATIVE_DLL_DIR`: DLL directory for the native helper; defaults to `RENDERDOC_NATIVE_MODULE_DIR`
+
+The server also runs a lightweight background janitor for idle sessions, so an unused capture is closed even when no later MCP request arrives.
+
+## Development
+
+```powershell
+uv sync --group dev
+uv run pytest -q
+uv run ruff check .
+uv run mypy
+uv build
+```
+
+Tests that need a locally installed RenderDoc build and a replayable `.rdc` capture are marked `integration` and skip when those prerequisites are unavailable. CI runs the remaining suite on Python 3.10, 3.12, and 3.14 on Windows, plus lint, type, coverage, and package-build checks.
 
 <a id="zh-cn"></a>
 ## 简体中文
@@ -438,6 +471,7 @@ uv run renderdoc-mcp
 - `renderdoc_get_pixel_history`
 - `renderdoc_debug_pixel`
 - `renderdoc_trace_bad_pixel`
+- `renderdoc_probe_texture_regions`
 - `renderdoc_start_pixel_shader_debug`
 - `renderdoc_start_compute_shader_debug`
 - `renderdoc_continue_shader_debug`
@@ -549,8 +583,60 @@ renderdoc_get_buffer_data(
 )
 ```
 
+在选择要调试的像素前，可以先扫描稀疏或异常活跃区域：
+
+```powershell
+renderdoc_probe_texture_regions(
+  capture_id="<capture_id>",
+  texture_id="ResourceId::123",
+  x=0,
+  y=0,
+  width=256,
+  height=256,
+  channel_mode="any",
+  threshold=0.5
+)
+```
+
 完成后关闭：
 
 ```powershell
 renderdoc_close_capture(capture_id="<capture_id>")
 ```
+
+## 安装与运行
+
+```powershell
+uv sync --group dev
+uv run renderdoc-install-extension
+uv run renderdoc-mcp
+```
+
+扩展会安装到 `%APPDATA%\qrenderdoc\extensions\renderdoc_mcp_bridge`，默认同时写入 `UI.config` 的 `AlwaysLoad_Extensions`。若不希望修改配置，可使用 `uv run renderdoc-install-extension --no-always-load`，或设置 `$env:RENDERDOC_INSTALL_ALWAYS_LOAD = "0"`。
+
+安装器使用跨进程锁并以完整快照替换扩展，自动排除 `__pycache__`/`.pyc`；已安装文件被修改或缺失时，下次启动会自动修复。若现有 `UI.config` 不是有效 JSON，安装器会保留原文件并给出警告。
+
+## 环境变量
+
+- `RENDERDOC_BACKEND`：`qrenderdoc`（默认）或 `native_python`
+- `RENDERDOC_QRENDERDOC_PATH`：自定义 `qrenderdoc.exe` 路径
+- `RENDERDOC_BRIDGE_TIMEOUT_SECONDS`：后端启动握手超时，默认 `30` 秒
+- `RENDERDOC_CAPTURE_SESSION_IDLE_SECONDS`：capture session 空闲超时，默认 `300` 秒；设为 `0` 或负数可关闭空闲回收
+- `RENDERDOC_CAPTURE_MAX_SESSIONS`：最多保留的 capture session 数，默认 `8`；优先回收最久未使用且当前空闲的 session，设为 `0` 或负数可关闭数量限制
+- `RENDERDOC_NATIVE_MODULE_DIR`：`native_python` 模式下 `renderdoc.pyd` 所在目录
+- `RENDERDOC_NATIVE_PYTHON_EXE`：native helper 使用的 Python，默认当前解释器
+- `RENDERDOC_NATIVE_DLL_DIR`：native helper 的 DLL 目录，默认与 module 目录相同
+
+服务端会在后台定期清理空闲 session，即使之后没有新的 MCP 请求，超时 capture 也会被关闭。
+
+## 开发与验证
+
+```powershell
+uv sync --group dev
+uv run pytest -q
+uv run ruff check .
+uv run mypy
+uv build
+```
+
+依赖本机 RenderDoc 和可回放 `.rdc` 的测试标记为 `integration`，缺少前置条件时会跳过。Windows CI 覆盖 Python 3.10、3.12、3.14，并执行 lint、类型检查、覆盖率和打包验证。
