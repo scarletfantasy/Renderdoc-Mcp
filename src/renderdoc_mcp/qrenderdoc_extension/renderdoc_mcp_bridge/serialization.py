@@ -64,6 +64,17 @@ def _resource_name(ctx, resource_id):
         return str(resource_id)
 
 
+def _cached_resource_name(ctx, resource_id, cache):
+    normalized_id = _resource_id(resource_id)
+    if not normalized_id:
+        return ""
+    if cache is None:
+        return _resource_name(ctx, resource_id)
+    if normalized_id not in cache:
+        cache[normalized_id] = _resource_name(ctx, resource_id)
+    return cache[normalized_id]
+
+
 def _resource_format(fmt):
     return {
         "name": str(fmt),
@@ -150,7 +161,7 @@ def _serialize_event(api_event):
     return payload
 
 
-def _serialize_action_analysis_node(ctx, action, structured_file):
+def _serialize_action_analysis_node(ctx, action, structured_file, resource_name_cache=None):
     name = action.GetName(structured_file) or action.customName or "Event {}".format(action.eventId)
     return {
         "event_id": int(action.eventId),
@@ -165,26 +176,36 @@ def _serialize_action_analysis_node(ctx, action, structured_file):
         "dispatch_dimension": [int(x) for x in action.dispatchDimension],
         "dispatch_threads_dimension": [int(x) for x in action.dispatchThreadsDimension],
         "outputs": [
-            {"resource_id": _resource_id(res_id), "resource_name": _resource_name(ctx, res_id)}
+            {
+                "resource_id": _resource_id(res_id),
+                "resource_name": _cached_resource_name(ctx, res_id, resource_name_cache),
+            }
             for res_id in action.outputs
             if _resource_id(res_id)
         ],
         "copy_source": {
             "resource_id": _resource_id(getattr(action, "copySource", None)),
-            "resource_name": _resource_name(ctx, getattr(action, "copySource", None)),
+            "resource_name": _cached_resource_name(ctx, getattr(action, "copySource", None), resource_name_cache),
             "subresource": _subresource(getattr(action, "copySourceSubresource", None)),
         },
         "copy_destination": {
             "resource_id": _resource_id(getattr(action, "copyDestination", None)),
-            "resource_name": _resource_name(ctx, getattr(action, "copyDestination", None)),
+            "resource_name": _cached_resource_name(
+                ctx,
+                getattr(action, "copyDestination", None),
+                resource_name_cache,
+            ),
             "subresource": _subresource(getattr(action, "copyDestinationSubresource", None)),
         },
         "depth_output": {
             "resource_id": _resource_id(action.depthOut),
-            "resource_name": _resource_name(ctx, action.depthOut),
+            "resource_name": _cached_resource_name(ctx, action.depthOut, resource_name_cache),
         },
         "parent_event_id": int(action.parent.eventId) if action.parent is not None else None,
-        "children": [_serialize_action_analysis_node(ctx, child, structured_file) for child in action.children],
+        "children": [
+            _serialize_action_analysis_node(ctx, child, structured_file, resource_name_cache)
+            for child in action.children
+        ],
     }
 
 

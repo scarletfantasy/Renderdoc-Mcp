@@ -64,6 +64,9 @@ PROBE_MAX_DIMENSION = 128
 PROBE_MAX_PIXELS = 16384
 PROBE_SUPPORTED_CHANNEL_MODES = {"luma", "max_rgb", "alpha", "any", "nan_inf", "local_outlier", "gradient"}
 MAX_SHADER_CODE_CACHE_ENTRIES = 64
+MAX_PIPELINE_CACHE_ENTRIES = 32
+MAX_RESOURCE_BINDING_CACHE_ENTRIES = 1024
+MAX_TEXTURE_GRID_CACHE_PIXELS = 32768
 MAX_DOSSIER_BINDING_ITEMS = 128
 MAX_DOSSIER_BATCH_RESPONSE_BYTES = 192 * 1024
 MAX_RESOURCE_BINDING_RESPONSE_ITEMS = 128
@@ -521,9 +524,15 @@ class BridgeClient(object):
         self.stop_event = threading.Event()
         self.thread = None
         self.analysis_cache = frame_analysis.AnalysisCache()
+        self.timing_capability_cache = frame_analysis.AnalysisCache()
+        self.shader_debug_capability_cache = frame_analysis.AnalysisCache()
         self.timing_cache = frame_analysis.AnalysisCache()
         self.resource_catalog_cache = frame_analysis.AnalysisCache()
         self.shader_code_cache = OrderedDict()
+        self.pipeline_cache = OrderedDict()
+        self.resource_binding_cache = OrderedDict()
+        self.texture_grid_cache = OrderedDict()
+        self.texture_grid_cache_pixels = 0
         self.shader_debug_sessions = {}
         self.runtime = BridgeRuntime(self)
         self.capture_ops = CaptureOps(self)
@@ -593,7 +602,7 @@ class BridgeClient(object):
         if not self.ctx.IsCaptureLoaded():
             raise BridgeError("replay_failure", "No capture is currently loaded in qrenderdoc.")
 
-    def _set_event(self, event_id):
+    def _set_event(self, event_id, force=True):
         action = self.ctx.GetAction(event_id)
         if action is None:
             raise BridgeError(
@@ -602,7 +611,7 @@ class BridgeClient(object):
                 {"event_id": int(event_id)},
             )
         try:
-            self.ctx.SetEventID([], event_id, event_id, True)
+            self.ctx.SetEventID([], event_id, event_id, bool(force))
         except TypeError:
             self.ctx.SetEventID([], event_id, event_id)
         return action
@@ -616,9 +625,15 @@ class BridgeClient(object):
 
     def _clear_analysis_cache(self):
         self.analysis_cache.clear()
+        self.timing_capability_cache.clear()
+        self.shader_debug_capability_cache.clear()
         self.timing_cache.clear()
         self.resource_catalog_cache.clear()
         self.shader_code_cache.clear()
+        self.pipeline_cache.clear()
+        self.resource_binding_cache.clear()
+        self.texture_grid_cache.clear()
+        self.texture_grid_cache_pixels = 0
         self._clear_shader_debug_sessions()
 
     def _clear_shader_debug_sessions(self):
@@ -652,22 +667,54 @@ class BridgeClient(object):
         except Exception:
             return False
 
-    def _instruction_info_for_state(self, trace, state):
-        instruction_index = int(getattr(state, "nextInstruction", -1))
-        for info in _safe_list(getattr(trace, "instInfo", [])):
+    def _ensure_shader_debug_capability(self):
+        return bool(self._ensure_capture_capabilities()[1].get("supported", False))
+
+    def _ensure_capture_capabilities(self):
+        self._ensure_capture_loaded()
+        cache_key = self._capture_cache_key()
+        timing_capability = self.timing_capability_cache.get(cache_key)
+        shader_capability = self.shader_debug_capability_cache.get(cache_key)
+        if timing_capability is not None and shader_capability is not None:
+            return timing_capability, shader_capability
+
+        payload = {}
+
+        def callback(controller):
+            if timing_capability is None:
+                payload["timing"] = self._timing_capability_from_controller(controller)
+            if shader_capability is None:
+                payload["shader"] = {"supported": self._controller_shader_debugging_supported(controller)}
+
+        self.ctx.Replay().BlockInvoke(callback)
+        if timing_capability is None:
+            timing_capability = self.timing_capability_cache.store(cache_key, payload["timing"])
+        if shader_capability is None:
+            shader_capability = self.shader_debug_capability_cache.store(cache_key, payload["shader"])
+        return timing_capability, shader_capability
+
+    def _build_instruction_info_index(self, trace):
+        index = {}
+        for position, info in enumerate(_safe_list(getattr(trace, "instInfo", []))):
             try:
-                if int(getattr(info, "instruction", -1)) == instruction_index:
-                    return info
+                instruction = int(getattr(info, "instruction", position))
             except Exception:
-                continue
+                instruction = position
+            if instruction not in index:
+                index[instruction] = info
+            if position not in index:
+                index[position] = info
+        return index
 
-        infos = _safe_list(getattr(trace, "instInfo", []))
-        if 0 <= instruction_index < len(infos):
-            return infos[instruction_index]
-        return None
+    def _instruction_info_for_state(self, trace, state, instruction_info_by_index=None):
+        instruction_index = int(getattr(state, "nextInstruction", -1))
+        lookup = instruction_info_by_index
+        if lookup is None:
+            lookup = self._build_instruction_info_index(trace)
+        return lookup.get(instruction_index)
 
-    def _serialize_shader_debug_state_summary(self, trace, state):
-        instruction_info = self._instruction_info_for_state(trace, state)
+    def _serialize_shader_debug_state_summary(self, trace, state, instruction_info_by_index=None):
+        instruction_info = self._instruction_info_for_state(trace, state, instruction_info_by_index)
         return {
             "step_index": int(getattr(state, "stepIndex", 0)),
             "next_instruction": int(getattr(state, "nextInstruction", 0)),
@@ -691,7 +738,11 @@ class BridgeClient(object):
         }
 
     def _serialize_shader_debug_step_payload(self, session, state, change_limit):
-        instruction_info = self._instruction_info_for_state(session["trace"], state)
+        instruction_info = self._instruction_info_for_state(
+            session["trace"],
+            state,
+            session.get("instruction_info_by_index"),
+        )
         changes = _safe_list(getattr(state, "changes", []))
         serialized_changes = [_serialize_shader_change(change) for change in changes[: max(1, int(change_limit or 1))]]
         return {
@@ -745,11 +796,19 @@ class BridgeClient(object):
                 session["completed"] = True
                 break
 
-    def _consume_shader_debug_state_page(self, session, limit):
+    def _drain_shader_debug_pending_states(self, session, limit):
         count = min(max(1, int(limit or 1)), len(session["pending_states"]))
         raw_states = session["pending_states"][:count]
         del session["pending_states"][:count]
-        return [self._serialize_shader_debug_state_summary(session["trace"], state) for state in raw_states]
+        return raw_states
+
+    def _consume_shader_debug_state_page(self, session, limit):
+        raw_states = self._drain_shader_debug_pending_states(session, limit)
+        instruction_info_by_index = session.get("instruction_info_by_index")
+        return [
+            self._serialize_shader_debug_state_summary(session["trace"], state, instruction_info_by_index)
+            for state in raw_states
+        ]
 
     def _get_shader_debug_session(self, shader_debug_id):
         session = self.shader_debug_sessions.get(str(shader_debug_id or ""))
@@ -805,8 +864,12 @@ class BridgeClient(object):
             structured_file = controller.GetStructuredFile()
             root_actions = controller.GetRootActions()
             metadata = self._build_frame_metadata(controller)
+            resource_name_cache = {}
             payload["value"] = frame_analysis.build_frame_analysis(
-                [_serialize_action_analysis_node(self.ctx, action, structured_file) for action in root_actions],
+                [
+                    _serialize_action_analysis_node(self.ctx, action, structured_file, resource_name_cache)
+                    for action in root_actions
+                ],
                 metadata,
             )
 
@@ -817,7 +880,7 @@ class BridgeClient(object):
         analysis = self._ensure_frame_analysis()
         event_id = int(analysis.get("max_event_id", 0))
         if event_id > 0:
-            self._set_event(event_id)
+            self._set_event(event_id, False)
         return analysis
 
     def _ensure_resource_catalog(self):
@@ -1109,6 +1172,41 @@ class BridgeClient(object):
             "flags": _action_flags(action),
         }
 
+    def _timing_capability_from_controller(self, controller):
+        event_counter = None
+        if rd is not None and hasattr(rd, "GPUCounter") and hasattr(rd.GPUCounter, "EventGPUDuration"):
+            event_counter = rd.GPUCounter.EventGPUDuration
+        if event_counter is None:
+            return {
+                "timing_available": False,
+                "counter_name": "EventGPUDuration",
+                "reason": "This RenderDoc build does not expose GPUCounter.EventGPUDuration.",
+                "result_type_name": "",
+                "result_byte_width": 0,
+            }
+
+        counters = list(controller.EnumerateCounters() or [])
+        if event_counter not in counters:
+            return {
+                "timing_available": False,
+                "counter_name": _enum_name(event_counter),
+                "reason": "The active replay device does not support the EventGPUDuration counter.",
+                "result_type_name": "",
+                "result_byte_width": 0,
+            }
+
+        counter_desc = controller.DescribeCounter(event_counter)
+        return {
+            "timing_available": True,
+            "counter_name": _enum_name(event_counter),
+            "reason": "",
+            "result_type_name": _enum_name(getattr(counter_desc, "resultType", "")),
+            "result_byte_width": int(getattr(counter_desc, "resultByteWidth", 0)),
+        }
+
+    def _ensure_timing_capability(self):
+        return self._ensure_capture_capabilities()[0]
+
     def _ensure_timing_data(self):
         self._ensure_capture_loaded()
         cache_key = self._capture_cache_key()
@@ -1116,35 +1214,24 @@ class BridgeClient(object):
         if cached is not None:
             return cached
 
+        capability = self._ensure_timing_capability()
+        if not capability.get("timing_available"):
+            return self.timing_cache.store(
+                cache_key,
+                {
+                    "timing_available": False,
+                    "counter_name": capability.get("counter_name", "EventGPUDuration"),
+                    "rows": [],
+                    "reason": capability.get("reason", "GPU timing is unavailable."),
+                },
+            )
+
         payload = {}
 
         def callback(controller):
-            event_counter = None
-            if rd is not None and hasattr(rd, "GPUCounter") and hasattr(rd.GPUCounter, "EventGPUDuration"):
-                event_counter = rd.GPUCounter.EventGPUDuration
-
-            if event_counter is None:
-                payload["value"] = {
-                    "timing_available": False,
-                    "counter_name": "EventGPUDuration",
-                    "rows": [],
-                    "reason": "This RenderDoc build does not expose GPUCounter.EventGPUDuration.",
-                }
-                return
-
-            counters = list(controller.EnumerateCounters() or [])
-            if event_counter not in counters:
-                payload["value"] = {
-                    "timing_available": False,
-                    "counter_name": _enum_name(event_counter),
-                    "rows": [],
-                    "reason": "The active replay device does not support the EventGPUDuration counter.",
-                }
-                return
-
-            counter_desc = controller.DescribeCounter(event_counter)
-            result_type_name = _enum_name(getattr(counter_desc, "resultType", ""))
-            byte_width = int(getattr(counter_desc, "resultByteWidth", 0))
+            event_counter = rd.GPUCounter.EventGPUDuration
+            result_type_name = capability.get("result_type_name", "")
+            byte_width = int(capability.get("result_byte_width", 0))
             rows = []
             for item in controller.FetchCounters([event_counter]) or []:
                 seconds = _counter_value_as_float(getattr(item, "value", None), result_type_name, byte_width)
@@ -1158,7 +1245,7 @@ class BridgeClient(object):
                 )
             payload["value"] = {
                 "timing_available": True,
-                "counter_name": _enum_name(event_counter),
+                "counter_name": capability.get("counter_name", _enum_name(event_counter)),
                 "rows": sorted(rows, key=lambda row: row["event_id"]),
             }
 
@@ -1294,20 +1381,17 @@ class BridgeClient(object):
     def _get_capture_overview(self):
         overview = self._get_capture_summary()
         analysis = self._ensure_frame_analysis()
-        timing_payload = self._ensure_timing_data()
-        shader_debugging = {"supported": False}
-
-        def callback(controller):
-            shader_debugging["supported"] = self._controller_shader_debugging_supported(controller)
-
-        self.ctx.Replay().BlockInvoke(callback)
+        timing_capability = self._ensure_timing_capability()
+        timing_collected = self.timing_cache.get(self._capture_cache_key()) is not None
+        shader_debugging_supported = self._ensure_shader_debug_capability()
         overview["root_pass_count"] = len(analysis.get("root_pass_ids", []))
         overview["action_root_count"] = len(analysis.get("root_action_ids", []))
         overview["capabilities"] = {
-            "timing_data": bool(timing_payload.get("timing_available")),
+            "timing_data": bool(timing_capability.get("timing_available")),
+            "timing_data_collected": bool(timing_collected),
             "pixel_history": True,
             "shader_disassembly": True,
-            "shader_debugging": bool(shader_debugging["supported"]),
+            "shader_debugging": bool(shader_debugging_supported),
         }
         return overview
 
@@ -1580,6 +1664,7 @@ class BridgeClient(object):
 
     def _pipeline_overview_from_payload(self, event_id, pipeline_payload, api_pipeline_payload):
         pipeline = pipeline_payload.get("pipeline", {})
+        api_details_collected = bool(api_pipeline_payload)
         shaders = [self._compact_shader_binding(item) for item in pipeline.get("shaders", [])]
         semantic_counts = {}
         for binding_kind in ("read_only_resources", "read_write_resources", "samplers", "constant_blocks"):
@@ -1606,7 +1691,12 @@ class BridgeClient(object):
                     "constant_blocks": semantic_counts["constant_blocks"],
                 },
                 "shaders": shaders,
-                "api_details_available": bool((api_pipeline_payload.get("api_pipeline") or {}).get("available", False)),
+                "api_details_collected": api_details_collected,
+                "api_details_available": (
+                    bool((api_pipeline_payload.get("api_pipeline") or {}).get("available", False))
+                    if api_details_collected
+                    else False
+                ),
                 "api_details_api": (api_pipeline_payload.get("api_pipeline") or {}).get(
                     "api",
                     api_pipeline_payload.get("api", ""),
@@ -1616,8 +1706,7 @@ class BridgeClient(object):
         return overview
 
     def _get_pipeline_overview(self, event_id):
-        pipeline_payload = self._get_pipeline_state(event_id)
-        api_pipeline_payload = self._get_api_pipeline_state(event_id)
+        pipeline_payload, api_pipeline_payload = self._get_pipeline_bundle(event_id, True)
         return self._pipeline_overview_from_payload(event_id, pipeline_payload, api_pipeline_payload)
 
     def _pipeline_binding_items(self, pipeline, api_pipeline_payload, binding_kind):
@@ -1645,8 +1734,11 @@ class BridgeClient(object):
         return [api_details] if api_details is not None else []
 
     def _list_pipeline_bindings(self, event_id, binding_kind, cursor, limit):
-        pipeline_payload = self._get_pipeline_state(event_id)
-        api_pipeline_payload = self._get_api_pipeline_state(event_id)
+        if binding_kind == "api_details":
+            pipeline_payload, api_pipeline_payload = self._get_pipeline_bundle(event_id, True)
+        else:
+            pipeline_payload = self._get_pipeline_state(event_id)
+            api_pipeline_payload = {}
         pipeline = pipeline_payload.get("pipeline", {})
 
         items = self._pipeline_binding_items(pipeline, api_pipeline_payload, binding_kind)
@@ -1672,15 +1764,19 @@ class BridgeClient(object):
                 {"event_id": int(event_id)},
             )
 
-        pipeline_payload = self._get_pipeline_state(event_id)
-        api_pipeline_payload = self._get_api_pipeline_state(event_id)
+        requested_binding_kinds = list(binding_kinds or ["output_targets", "shaders"])
+        if "api_details" in requested_binding_kinds:
+            pipeline_payload, api_pipeline_payload = self._get_pipeline_bundle(event_id, True)
+        else:
+            pipeline_payload = self._get_pipeline_state(event_id)
+            api_pipeline_payload = {}
         overview = self._pipeline_overview_from_payload(event_id, pipeline_payload, api_pipeline_payload)
         pipeline = pipeline_payload.get("pipeline", {})
         bindings = {}
         per_kind_limit = max(1, min(100, int(binding_limit or 20)))
         remaining_binding_budget = MAX_DOSSIER_BINDING_ITEMS
         returned_binding_count = 0
-        for binding_kind in list(binding_kinds or ["output_targets", "shaders"]):
+        for binding_kind in requested_binding_kinds:
             items = self._pipeline_binding_items(pipeline, api_pipeline_payload, binding_kind)
             returned_limit = min(per_kind_limit, remaining_binding_budget)
             returned_items = items[:returned_limit]
@@ -1966,125 +2062,177 @@ class BridgeClient(object):
         while len(self.shader_code_cache) > MAX_SHADER_CODE_CACHE_ENTRIES:
             self.shader_code_cache.popitem(last=False)
 
-    def _get_pipeline_state(self, event_id):
-        self._ensure_capture_loaded()
-        action = self._set_event(event_id)
-        response = {"event_id": int(event_id)}
+    def _pipeline_cache_get(self, event_id):
+        cache_key = int(event_id)
+        cached = self.pipeline_cache.get(cache_key)
+        if cached is not None:
+            self.pipeline_cache.move_to_end(cache_key)
+        return cached
 
-        def callback(controller):
-            response["api"] = _api_name(controller)
-            response["action"] = {
+    def _pipeline_cache_store(self, event_id, pipeline_payload=None, api_pipeline_payload=None):
+        cache_key = int(event_id)
+        cached = self.pipeline_cache.get(cache_key)
+        if cached is None:
+            cached = {}
+            self.pipeline_cache[cache_key] = cached
+        if pipeline_payload is not None:
+            cached["pipeline_payload"] = pipeline_payload
+        if api_pipeline_payload is not None:
+            cached["api_pipeline_payload"] = api_pipeline_payload
+        self.pipeline_cache.move_to_end(cache_key)
+        while len(self.pipeline_cache) > MAX_PIPELINE_CACHE_ENTRIES:
+            self.pipeline_cache.popitem(last=False)
+        return cached
+
+    def _build_pipeline_state_payload(self, controller, action, event_id):
+        response = {
+            "event_id": int(event_id),
+            "api": _api_name(controller),
+            "action": {
                 "event_id": int(action.eventId),
-                "name": action.GetName(controller.GetStructuredFile()) or action.customName or "Event {}".format(action.eventId),
+                "name": action.GetName(controller.GetStructuredFile())
+                or action.customName
+                or "Event {}".format(action.eventId),
                 "flags": _action_flags(action),
-            }
-            state = _call_method_variants(controller, "GetPipelineState", [()], default=None)
-            if state is None:
-                response["pipeline"] = {
-                    "available": False,
-                    "reason": "RenderDoc did not expose GetPipelineState in this build.",
-                    "topology": "Unknown",
-                    "graphics_pipeline_object": "",
-                    "compute_pipeline_object": "",
-                    "index_buffer": _serialize_bound_vbuffer(self.ctx, None),
-                    "vertex_buffers": [],
-                    "vertex_inputs": [],
-                    "output_targets": [],
-                    "depth_target": _serialize_descriptor(self.ctx, None),
-                    "depth_resolve_target": _serialize_descriptor(self.ctx, None),
-                    "descriptor_accesses": [],
-                    "shaders": [],
-                }
-                return
-
-            descriptor_accesses = _call_method_variants(state, "GetDescriptorAccess", [()], default=[])
+            },
+        }
+        state = _call_method_variants(controller, "GetPipelineState", [()], default=None)
+        if state is None:
             response["pipeline"] = {
-                "available": True,
-                "topology": _enum_name(_call_method_variants(state, "GetPrimitiveTopology", [()], default="Unknown")),
-                "graphics_pipeline_object": _resource_id(
-                    _call_method_variants(state, "GetGraphicsPipelineObject", [()], default=None)
-                ),
-                "compute_pipeline_object": _resource_id(
-                    _call_method_variants(state, "GetComputePipelineObject", [()], default=None)
-                ),
-                "index_buffer": _serialize_bound_vbuffer(
-                    self.ctx,
-                    _call_method_variants(state, "GetIBuffer", [()], default=None),
-                ),
-                "vertex_buffers": [
-                    _serialize_bound_vbuffer(self.ctx, vb)
-                    for vb in _safe_list(_call_method_variants(state, "GetVBuffers", [()], default=[]))
-                ],
-                "vertex_inputs": [
-                    _serialize_vertex_input(attr)
-                    for attr in _safe_list(_call_method_variants(state, "GetVertexInputs", [()], default=[]))
-                ],
-                "output_targets": [
-                    _serialize_descriptor(self.ctx, desc)
-                    for desc in _safe_list(_call_method_variants(state, "GetOutputTargets", [()], default=[]))
-                ],
-                "depth_target": _serialize_descriptor(
-                    self.ctx,
-                    _call_method_variants(state, "GetDepthTarget", [()], default=None),
-                ),
-                "depth_resolve_target": _serialize_descriptor(
-                    self.ctx,
-                    _call_method_variants(state, "GetDepthResolveTarget", [()], default=None),
-                ),
-                "descriptor_accesses": [_serialize_descriptor_access(item) for item in _safe_list(descriptor_accesses)],
+                "available": False,
+                "reason": "RenderDoc did not expose GetPipelineState in this build.",
+                "topology": "Unknown",
+                "graphics_pipeline_object": "",
+                "compute_pipeline_object": "",
+                "index_buffer": _serialize_bound_vbuffer(self.ctx, None),
+                "vertex_buffers": [],
+                "vertex_inputs": [],
+                "output_targets": [],
+                "depth_target": _serialize_descriptor(self.ctx, None),
+                "depth_resolve_target": _serialize_descriptor(self.ctx, None),
+                "descriptor_accesses": [],
                 "shaders": [],
             }
+            return response
 
-            for stage in _shader_stage_values():
-                serialized = _serialize_shader_stage(self.ctx, state, stage)
-                if serialized is not None:
-                    response["pipeline"]["shaders"].append(serialized)
-
-        self.ctx.Replay().BlockInvoke(callback)
+        descriptor_accesses = _call_method_variants(state, "GetDescriptorAccess", [()], default=[])
+        response["pipeline"] = {
+            "available": True,
+            "topology": _enum_name(_call_method_variants(state, "GetPrimitiveTopology", [()], default="Unknown")),
+            "graphics_pipeline_object": _resource_id(
+                _call_method_variants(state, "GetGraphicsPipelineObject", [()], default=None)
+            ),
+            "compute_pipeline_object": _resource_id(
+                _call_method_variants(state, "GetComputePipelineObject", [()], default=None)
+            ),
+            "index_buffer": _serialize_bound_vbuffer(
+                self.ctx,
+                _call_method_variants(state, "GetIBuffer", [()], default=None),
+            ),
+            "vertex_buffers": [
+                _serialize_bound_vbuffer(self.ctx, vb)
+                for vb in _safe_list(_call_method_variants(state, "GetVBuffers", [()], default=[]))
+            ],
+            "vertex_inputs": [
+                _serialize_vertex_input(attr)
+                for attr in _safe_list(_call_method_variants(state, "GetVertexInputs", [()], default=[]))
+            ],
+            "output_targets": [
+                _serialize_descriptor(self.ctx, desc)
+                for desc in _safe_list(_call_method_variants(state, "GetOutputTargets", [()], default=[]))
+            ],
+            "depth_target": _serialize_descriptor(
+                self.ctx,
+                _call_method_variants(state, "GetDepthTarget", [()], default=None),
+            ),
+            "depth_resolve_target": _serialize_descriptor(
+                self.ctx,
+                _call_method_variants(state, "GetDepthResolveTarget", [()], default=None),
+            ),
+            "descriptor_accesses": [_serialize_descriptor_access(item) for item in _safe_list(descriptor_accesses)],
+            "shaders": [],
+        }
+        for stage in _shader_stage_values():
+            serialized = _serialize_shader_stage(self.ctx, state, stage)
+            if serialized is not None:
+                response["pipeline"]["shaders"].append(serialized)
         return response
 
-    def _get_api_pipeline_state(self, event_id):
-        self._ensure_capture_loaded()
-        action = self._set_event(event_id)
-        response = {"event_id": int(event_id)}
-
-        def callback(controller):
-            api_name = _api_name(controller)
-            response["api"] = api_name
-            response["action"] = {
+    def _build_api_pipeline_state_payload(self, controller, action, event_id):
+        api_name = _api_name(controller)
+        response = {
+            "event_id": int(event_id),
+            "api": api_name,
+            "action": {
                 "event_id": int(action.eventId),
-                "name": action.GetName(controller.GetStructuredFile()) or action.customName or "Event {}".format(action.eventId),
+                "name": action.GetName(controller.GetStructuredFile())
+                or action.customName
+                or "Event {}".format(action.eventId),
                 "flags": _action_flags(action),
-            }
-            if api_name == "D3D12" and hasattr(controller, "GetD3D12PipelineState"):
-                value = _call_method_variants(controller, "GetD3D12PipelineState", [()], default=None)
-                if value is None:
-                    response["api_pipeline"] = {
-                        "api": api_name,
-                        "available": False,
-                        "reason": "RenderDoc did not expose a compatible D3D12 pipeline accessor in this build.",
-                    }
-                else:
-                    response["api_pipeline"] = _serialize_d3d12_pipeline_state(self.ctx, value)
-            elif api_name == "Vulkan" and hasattr(controller, "GetVulkanPipelineState"):
-                value = _call_method_variants(controller, "GetVulkanPipelineState", [()], default=None)
-                if value is None:
-                    response["api_pipeline"] = {
-                        "api": api_name,
-                        "available": False,
-                        "reason": "RenderDoc did not expose a compatible Vulkan pipeline accessor in this build.",
-                    }
-                else:
-                    response["api_pipeline"] = _serialize_vulkan_pipeline_state(self.ctx, value)
-            else:
+            },
+        }
+        if api_name == "D3D12" and hasattr(controller, "GetD3D12PipelineState"):
+            value = _call_method_variants(controller, "GetD3D12PipelineState", [()], default=None)
+            if value is None:
                 response["api_pipeline"] = {
                     "api": api_name,
                     "available": False,
-                    "reason": "No API-specific pipeline serializer is implemented for this capture API.",
+                    "reason": "RenderDoc did not expose a compatible D3D12 pipeline accessor in this build.",
                 }
+            else:
+                response["api_pipeline"] = _serialize_d3d12_pipeline_state(self.ctx, value)
+        elif api_name == "Vulkan" and hasattr(controller, "GetVulkanPipelineState"):
+            value = _call_method_variants(controller, "GetVulkanPipelineState", [()], default=None)
+            if value is None:
+                response["api_pipeline"] = {
+                    "api": api_name,
+                    "available": False,
+                    "reason": "RenderDoc did not expose a compatible Vulkan pipeline accessor in this build.",
+                }
+            else:
+                response["api_pipeline"] = _serialize_vulkan_pipeline_state(self.ctx, value)
+        else:
+            response["api_pipeline"] = {
+                "api": api_name,
+                "available": False,
+                "reason": "No API-specific pipeline serializer is implemented for this capture API.",
+            }
+        return response
+
+    def _get_pipeline_bundle(self, event_id, include_api_details=False):
+        self._ensure_capture_loaded()
+        cached = self._pipeline_cache_get(event_id) or {}
+        pipeline_payload = cached.get("pipeline_payload")
+        api_pipeline_payload = cached.get("api_pipeline_payload") if include_api_details else None
+        needs_pipeline = pipeline_payload is None
+        needs_api_pipeline = bool(include_api_details and api_pipeline_payload is None)
+        if not needs_pipeline and not needs_api_pipeline:
+            return pipeline_payload, api_pipeline_payload or {}
+
+        action = self._set_event(event_id)
+        generated = {}
+
+        def callback(controller):
+            if needs_pipeline:
+                generated["pipeline_payload"] = self._build_pipeline_state_payload(controller, action, event_id)
+            if needs_api_pipeline:
+                generated["api_pipeline_payload"] = self._build_api_pipeline_state_payload(controller, action, event_id)
 
         self.ctx.Replay().BlockInvoke(callback)
-        return response
+        cached = self._pipeline_cache_store(
+            event_id,
+            pipeline_payload=generated.get("pipeline_payload"),
+            api_pipeline_payload=generated.get("api_pipeline_payload"),
+        )
+        return cached.get("pipeline_payload", {}), (
+            cached.get("api_pipeline_payload", {}) if include_api_details else {}
+        )
+
+    def _get_pipeline_state(self, event_id):
+        return self._get_pipeline_bundle(event_id, False)[0]
+
+    def _get_api_pipeline_state(self, event_id):
+        return self._get_pipeline_bundle(event_id, True)[1]
 
     def _get_shader_code(self, event_id, stage_name, target):
         self._ensure_capture_loaded()
@@ -2431,6 +2579,7 @@ class BridgeClient(object):
                 "trace": trace,
                 "debugger": debugger,
                 "trace_summary": self._serialize_shader_debug_trace_summary(trace),
+                "instruction_info_by_index": self._build_instruction_info_index(trace),
                 "history": [],
                 "history_by_step": {},
                 "pending_states": [],
@@ -2561,6 +2710,7 @@ class BridgeClient(object):
                 "trace": trace,
                 "debugger": debugger,
                 "trace_summary": self._serialize_shader_debug_trace_summary(trace),
+                "instruction_info_by_index": self._build_instruction_info_index(trace),
                 "history": [],
                 "history_by_step": {},
                 "pending_states": [],
@@ -2636,7 +2786,7 @@ class BridgeClient(object):
                 remaining = maximum - len(session["history"])
                 self._fill_shader_debug_pending_states(controller, session, min(128, max(1, remaining)))
                 if session["pending_states"]:
-                    self._consume_shader_debug_state_page(session, min(128, max(1, remaining)))
+                    self._drain_shader_debug_pending_states(session, min(128, max(1, remaining)))
                 elif session["completed"]:
                     break
 
@@ -2648,9 +2798,14 @@ class BridgeClient(object):
         first_instruction = None
         last_instruction = None
         total_change_count = 0
+        instruction_info_by_index = session.get("instruction_info_by_index")
 
         for state in states:
-            summary = self._serialize_shader_debug_state_summary(session["trace"], state)
+            summary = self._serialize_shader_debug_state_summary(
+                session["trace"],
+                state,
+                instruction_info_by_index,
+            )
             instruction = int(summary.get("next_instruction", 0))
             first_instruction = instruction if first_instruction is None else first_instruction
             last_instruction = instruction
@@ -2691,7 +2846,11 @@ class BridgeClient(object):
         if not interesting and states:
             boundary_states = [states[0]] if len(states) == 1 else [states[0], states[-1]]
             interesting = [
-                self._serialize_shader_debug_state_summary(session["trace"], state)
+                self._serialize_shader_debug_state_summary(
+                    session["trace"],
+                    state,
+                    instruction_info_by_index,
+                )
                 for state in boundary_states
             ]
 
@@ -2808,14 +2967,7 @@ class BridgeClient(object):
         }
 
     def _capture_shader_debugging_supported(self):
-        self._ensure_capture_loaded()
-        payload = {"supported": False}
-
-        def callback(controller):
-            payload["supported"] = self._controller_shader_debugging_supported(controller)
-
-        self.ctx.Replay().BlockInvoke(callback)
-        return bool(payload["supported"])
+        return self._ensure_shader_debug_capability()
 
     def _trace_bad_pixel_reference(
         self,
@@ -3271,8 +3423,46 @@ class BridgeClient(object):
 
         return resolved_width, resolved_height
 
+    def _texture_grid_cache_get(self, cache_key):
+        cached = self.texture_grid_cache.get(cache_key)
+        if cached is None:
+            return None
+        self.texture_grid_cache.move_to_end(cache_key)
+        response = dict(cached["response"])
+        response["texture"] = dict(cached["response"].get("texture") or {})
+        response["query"] = dict(cached["response"].get("query") or {})
+        response["meta"] = dict(cached["response"].get("meta") or {})
+        response["meta"]["pixel_grid_cache_hit"] = True
+        return response
+
+    def _texture_grid_cache_store(self, cache_key, response, pixel_count):
+        previous = self.texture_grid_cache.pop(cache_key, None)
+        if previous is not None:
+            self.texture_grid_cache_pixels -= int(previous.get("pixel_count", 0))
+        self.texture_grid_cache[cache_key] = {
+            "response": response,
+            "pixel_count": int(pixel_count),
+        }
+        self.texture_grid_cache_pixels += int(pixel_count)
+        while self.texture_grid_cache_pixels > MAX_TEXTURE_GRID_CACHE_PIXELS and len(self.texture_grid_cache) > 1:
+            _, expired = self.texture_grid_cache.popitem(last=False)
+            self.texture_grid_cache_pixels -= int(expired.get("pixel_count", 0))
+
     def _probe_texture_pixel_grid(self, texture_id, mip_level, array_slice, sample, x, y, width, height):
         self._ensure_capture_loaded()
+        cache_key = (
+            str(texture_id),
+            int(mip_level),
+            int(array_slice),
+            int(sample),
+            int(x),
+            int(y),
+            int(width) if width is not None else None,
+            int(height) if height is not None else None,
+        )
+        cached = self._texture_grid_cache_get(cache_key)
+        if cached is not None:
+            return cached
         self._ensure_final_event()
         response = {
             "query": {
@@ -3331,8 +3521,14 @@ class BridgeClient(object):
                 "depth": validation["mip_depth"],
             }
             response["pixels"] = pixels
+            response["meta"] = {"pixel_grid_cache_hit": False}
 
         self._block_invoke_checked(callback)
+        self._texture_grid_cache_store(
+            cache_key,
+            response,
+            int(response["query"]["width"]) * int(response["query"]["height"]),
+        )
         return response
 
     def _probe_texture_regions(
@@ -3514,44 +3710,15 @@ class BridgeClient(object):
         }
 
     def _get_texture_data(self, texture_id, mip_level, x, y, width, height, array_slice, sample):
-        self._ensure_capture_loaded()
-        self._ensure_final_event()
-        response = {
-            "query": {
-                "texture_id": texture_id,
-                "x": int(x),
-                "y": int(y),
-                "width": int(width),
-                "height": int(height),
-                "mip_level": int(mip_level),
-                "array_slice": int(array_slice),
-                "sample": int(sample),
-            }
-        }
-
-        def callback(controller):
-            texture = self._find_texture_by_id(texture_id)
-            validation = self._validate_texture_request(texture, mip_level, array_slice, sample, x=x, y=y, width=width, height=height)
-            comp_type = self._default_comp_type(texture)
-            subresource = _subresource(mip_level, array_slice, sample)
-            pixels = []
-            for row_index in range(int(height)):
-                row = []
-                for column_index in range(int(width)):
-                    pixel = controller.PickPixel(texture.resourceId, int(x) + column_index, int(y) + row_index, subresource, comp_type)
-                    row.append(_serialize_sampled_pixel(pixel))
-                pixels.append(row)
-            response["texture"] = _serialize_texture(self.ctx, texture)
-            response["query"]["mip_dimensions"] = {
-                "width": validation["mip_width"],
-                "height": validation["mip_height"],
-                "depth": validation["mip_depth"],
-            }
-            response["row_count"] = len(pixels)
-            response["column_count"] = len(pixels[0]) if pixels else 0
-            response["pixels"] = pixels
-
-        self.ctx.Replay().BlockInvoke(callback)
+        grid = self._probe_texture_pixel_grid(texture_id, mip_level, array_slice, sample, x, y, width, height)
+        response = dict(grid)
+        response["texture"] = dict(grid.get("texture") or {})
+        response["query"] = dict(grid.get("query") or {})
+        response["meta"] = dict(grid.get("meta") or {})
+        pixels = list(grid.get("pixels") or [])
+        response["pixels"] = pixels
+        response["row_count"] = len(pixels)
+        response["column_count"] = len(pixels[0]) if pixels else 0
         return response
 
     def _get_buffer_data(self, buffer_id, offset, size, encoding):
@@ -3716,6 +3883,169 @@ class BridgeClient(object):
             limit=limit,
         )
 
+    def _resource_binding_cache_get(self, event_id, resource_id):
+        cache_key = (int(event_id), str(resource_id))
+        cached = self.resource_binding_cache.get(cache_key)
+        if cached is not None:
+            self.resource_binding_cache.move_to_end(cache_key)
+        return cached
+
+    def _resource_binding_cache_store(self, event_id, resource_id, value):
+        cache_key = (int(event_id), str(resource_id))
+        self.resource_binding_cache[cache_key] = value
+        self.resource_binding_cache.move_to_end(cache_key)
+        while len(self.resource_binding_cache) > MAX_RESOURCE_BINDING_CACHE_ENTRIES:
+            self.resource_binding_cache.popitem(last=False)
+
+    def _resource_binding_matches_from_pipeline(self, pipeline, resource_id):
+        event_bindings = []
+        event_binding_count = 0
+        for binding_kind in ("read_only_resources", "read_write_resources", "constant_blocks"):
+            for binding in self._pipeline_binding_items(pipeline, {}, binding_kind):
+                descriptor = binding.get("descriptor") or {}
+                ids = {
+                    str(descriptor.get("resource_id", "") or ""),
+                    str(descriptor.get("secondary_resource_id", "") or ""),
+                    str(descriptor.get("view_id", "") or ""),
+                }
+                if str(resource_id) not in ids:
+                    continue
+                event_binding_count += 1
+                if len(event_bindings) >= 32:
+                    continue
+                access = binding.get("access") or {}
+                event_bindings.append(
+                    {
+                        "binding_kind": binding_kind,
+                        "stage": binding.get("stage", access.get("stage", "")),
+                        "shader_id": binding.get("shader_id", ""),
+                        "shader_name": binding.get("shader_name", ""),
+                        "access_type": access.get("type", ""),
+                        "access_index": access.get("index"),
+                        "array_element": access.get("array_element"),
+                        "descriptor": descriptor,
+                    }
+                )
+        return {"bindings": event_bindings, "binding_count": event_binding_count}
+
+    def _resource_binding_matches_from_state(self, state, resource_id):
+        event_bindings = []
+        event_binding_count = 0
+        methods = (
+            ("read_only_resources", "GetReadOnlyResources"),
+            ("read_write_resources", "GetReadWriteResources"),
+            ("constant_blocks", "GetConstantBlocks"),
+        )
+        for stage in _shader_stage_values():
+            shader_id = _call_method_variants(state, "GetShader", [(stage,)], default=None)
+            if not _resource_id(shader_id):
+                continue
+            shader_name = None
+            for binding_kind, method_name in methods:
+                used_descriptors = _safe_list(
+                    _call_method_variants(state, method_name, [(stage, True), (stage,)], default=[])
+                )
+                for used in used_descriptors:
+                    descriptor_value = getattr(used, "descriptor", None)
+                    descriptor_ids = {
+                        _resource_id(getattr(descriptor_value, "resource", None)),
+                        _resource_id(getattr(descriptor_value, "secondary", None)),
+                        _resource_id(getattr(descriptor_value, "view", None)),
+                    }
+                    if str(resource_id) not in descriptor_ids:
+                        continue
+                    event_binding_count += 1
+                    if len(event_bindings) >= 32:
+                        continue
+                    if shader_name is None:
+                        try:
+                            shader_name = self.ctx.GetResourceName(shader_id) or str(shader_id)
+                        except Exception:
+                            shader_name = str(shader_id)
+                    access_value = getattr(used, "access", None)
+                    if access_value is None:
+                        continue
+                    access = _serialize_descriptor_access(access_value)
+                    event_bindings.append(
+                        {
+                            "binding_kind": binding_kind,
+                            "stage": _enum_name(stage),
+                            "shader_id": _resource_id(shader_id),
+                            "shader_name": shader_name,
+                            "access_type": access.get("type", ""),
+                            "access_index": access.get("index"),
+                            "array_element": access.get("array_element"),
+                            "descriptor": _serialize_descriptor(self.ctx, descriptor_value),
+                        }
+                    )
+        return {"bindings": event_bindings, "binding_count": event_binding_count}
+
+    def _scan_resource_bindings(self, event_ids, resource_id):
+        results = {}
+        missing_ids = []
+        cache_hit_count = 0
+        for event_id in event_ids:
+            cached = self._resource_binding_cache_get(event_id, resource_id)
+            if cached is None:
+                missing_ids.append(int(event_id))
+            else:
+                results[int(event_id)] = cached
+                cache_hit_count += 1
+
+        batch_supported = False
+        if missing_ids:
+            batch_payload = {"supported": False, "results": {}}
+
+            def callback(controller):
+                if not hasattr(controller, "SetFrameEvent"):
+                    return
+                batch_payload["supported"] = True
+                for event_id in missing_ids:
+                    set_result = _call_method_variants(
+                        controller,
+                        "SetFrameEvent",
+                        [(int(event_id), False), (int(event_id), True), (int(event_id),)],
+                        default=_METHOD_UNAVAILABLE,
+                    )
+                    if set_result is _METHOD_UNAVAILABLE:
+                        batch_payload["supported"] = False
+                        batch_payload["results"] = {}
+                        return
+                    state = _call_method_variants(controller, "GetPipelineState", [()], default=None)
+                    if state is None:
+                        batch_payload["results"][int(event_id)] = {"bindings": [], "binding_count": 0}
+                    else:
+                        batch_payload["results"][int(event_id)] = self._resource_binding_matches_from_state(
+                            state,
+                            resource_id,
+                        )
+
+            self._block_invoke_checked(callback)
+            batch_supported = bool(batch_payload["supported"])
+            if batch_supported:
+                results.update(batch_payload["results"])
+                self._set_event(missing_ids[-1], False)
+            else:
+                for event_id in missing_ids:
+                    pipeline_payload = self._get_pipeline_state(event_id)
+                    results[int(event_id)] = self._resource_binding_matches_from_pipeline(
+                        pipeline_payload.get("pipeline", {}),
+                        resource_id,
+                    )
+
+            for event_id in missing_ids:
+                self._resource_binding_cache_store(event_id, resource_id, results[int(event_id)])
+
+        return results, {
+            "mode": (
+                "cache"
+                if not missing_ids
+                else ("batched_replay" if batch_supported else "pipeline_fallback")
+            ),
+            "cache_hit_count": cache_hit_count,
+            "replayed_event_count": len(missing_ids),
+        }
+
     def _search_resource_bindings(self, resource_id, event_id_min, event_id_max, cursor, scan_limit, match_limit):
         resource_kind, resource = self._resource_usage_target(resource_id)
         analysis = self._ensure_frame_analysis()
@@ -3742,38 +4072,12 @@ class BridgeClient(object):
         total_binding_count = 0
         returned_binding_count = 0
         max_bindings_per_event = 32
+        binding_results, scan_performance = self._scan_resource_bindings(scanned_ids, resource_id)
 
         for event_id in scanned_ids:
-            pipeline_payload = self._get_pipeline_state(event_id)
-            pipeline = pipeline_payload.get("pipeline", {})
-            event_bindings = []
-            event_binding_count = 0
-            for binding_kind in ("read_only_resources", "read_write_resources", "constant_blocks"):
-                for binding in self._pipeline_binding_items(pipeline, {}, binding_kind):
-                    descriptor = binding.get("descriptor") or {}
-                    ids = {
-                        str(descriptor.get("resource_id", "") or ""),
-                        str(descriptor.get("secondary_resource_id", "") or ""),
-                        str(descriptor.get("view_id", "") or ""),
-                    }
-                    if str(resource_id) not in ids:
-                        continue
-                    event_binding_count += 1
-                    if len(event_bindings) >= max_bindings_per_event:
-                        continue
-                    access = binding.get("access") or {}
-                    event_bindings.append(
-                        {
-                            "binding_kind": binding_kind,
-                            "stage": binding.get("stage", access.get("stage", "")),
-                            "shader_id": binding.get("shader_id", ""),
-                            "shader_name": binding.get("shader_name", ""),
-                            "access_type": access.get("type", ""),
-                            "access_index": access.get("index"),
-                            "array_element": access.get("array_element"),
-                            "descriptor": descriptor,
-                        }
-                    )
+            event_result = binding_results.get(int(event_id), {"bindings": [], "binding_count": 0})
+            event_bindings = list(event_result.get("bindings", []))
+            event_binding_count = int(event_result.get("binding_count", 0))
             if not event_binding_count:
                 continue
             matched_event_count += 1
@@ -3821,6 +4125,7 @@ class BridgeClient(object):
                     ),
                     "max_bindings_per_event": max_bindings_per_event,
                     "response_binding_budget": MAX_RESOURCE_BINDING_RESPONSE_ITEMS,
+                    "performance": scan_performance,
                 }
             },
         }

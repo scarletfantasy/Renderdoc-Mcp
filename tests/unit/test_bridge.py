@@ -31,6 +31,7 @@ class FakeReplay:
         self.controller = controller
 
     def BlockInvoke(self, callback):
+        self.controller.block_invoke_count = getattr(self.controller, "block_invoke_count", 0) + 1
         callback(self.controller)
 
 
@@ -49,6 +50,7 @@ class FakeContext:
     def __init__(self, controller) -> None:
         self.controller = controller
         self.loaded = True
+        self.set_event_calls: list[tuple] = []
 
     def Extensions(self):
         return FakeExtensions()
@@ -63,6 +65,7 @@ class FakeContext:
         return FakeAction()
 
     def SetEventID(self, *args):
+        self.set_event_calls.append(tuple(args))
         return None
 
     def GetResourceName(self, resource_id):
@@ -120,6 +123,7 @@ class FakeController:
         self.debug_thread_calls: list[tuple[tuple[int, int, int], tuple[int, int, int]]] = []
         self.continue_debug_batches: list[list[object]] = []
         self.freed_traces: list[object] = []
+        self.block_invoke_count = 0
 
     def GetStructuredFile(self):
         return object()
@@ -333,6 +337,48 @@ def test_enum_name_uses_python_enum_names_for_native_renderdoc_bindings() -> Non
     assert serialization_module._enum_name(_EnumTopology.Unknown) == "Unknown"
 
 
+def test_frame_action_serialization_memoizes_repeated_resource_names() -> None:
+    class CountingContext:
+        def __init__(self) -> None:
+            self.resource_name_calls = 0
+
+        def GetResourceName(self, resource_id):
+            self.resource_name_calls += 1
+            return "SharedTexture"
+
+    def action(event_id, children=None):
+        node = SimpleNamespace(
+            eventId=event_id,
+            actionId=event_id,
+            customName="",
+            flags=0,
+            children=list(children or []),
+            numIndices=3,
+            numInstances=1,
+            dispatchDimension=[0, 0, 0],
+            dispatchThreadsDimension=[0, 0, 0],
+            outputs=["tex-1"],
+            copySource=None,
+            copySourceSubresource=None,
+            copyDestination=None,
+            copyDestinationSubresource=None,
+            depthOut="tex-1",
+            parent=None,
+            GetName=lambda structured_file: "Draw",
+            IsFakeMarker=lambda: False,
+        )
+        for child in node.children:
+            child.parent = node
+        return node
+
+    context = CountingContext()
+    root = action(1, [action(2)])
+
+    serialization_module._serialize_action_analysis_node(context, root, object(), {})
+
+    assert context.resource_name_calls == 1
+
+
 def test_bridge_client_pipeline_overview_uses_enum_names_for_api_and_topology() -> None:
     class EnumState(FakeState):
         def GetPrimitiveTopology(self):
@@ -370,6 +416,101 @@ def test_bridge_client_pipeline_bindings_degrades_when_accessor_signature_change
 
     assert response["items"][0]["available"] is False
     assert "compatible D3D12 pipeline accessor" in response["items"][0]["reason"]
+
+
+def test_pipeline_overview_combines_generic_and_api_state_and_reuses_cache() -> None:
+    class CachedController(FakeController):
+        def __init__(self) -> None:
+            super().__init__(api_name="D3D12")
+            self.api_pipeline_calls = 0
+
+        def GetD3D12PipelineState(self):
+            self.api_pipeline_calls += 1
+            return SimpleNamespace(
+                pipelineResourceId="pipe-1",
+                descriptorHeaps=[],
+                rootSignature=SimpleNamespace(resourceId=None, parameters=[], staticSamplers=[]),
+            )
+
+    controller = CachedController()
+    context = FakeContext(controller)
+    client = BridgeClient(context)
+
+    first = client._get_pipeline_overview(7)
+    second = client._get_pipeline_overview(7)
+
+    assert first == second
+    assert controller.block_invoke_count == 1
+    assert controller.api_pipeline_calls == 1
+    assert len(context.set_event_calls) == 1
+
+
+def test_non_api_pipeline_bindings_skip_api_specific_pipeline_serialization() -> None:
+    class CountingController(FakeController):
+        def __init__(self) -> None:
+            super().__init__(api_name="D3D12")
+            self.api_pipeline_calls = 0
+
+        def GetD3D12PipelineState(self):
+            self.api_pipeline_calls += 1
+            return None
+
+    controller = CountingController()
+    client = BridgeClient(FakeContext(controller))
+
+    response = client._list_pipeline_bindings(7, "output_targets", 0, 50)
+
+    assert response["binding_kind"] == "output_targets"
+    assert controller.block_invoke_count == 1
+    assert controller.api_pipeline_calls == 0
+
+
+def test_capture_overview_checks_timing_support_without_fetching_counters(monkeypatch) -> None:
+    event_counter = object()
+
+    class TimingController(FakeController):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fetch_counter_calls = 0
+
+        def EnumerateCounters(self):
+            return [event_counter]
+
+        def DescribeCounter(self, counter):
+            assert counter is event_counter
+            return SimpleNamespace(resultType="Double", resultByteWidth=8)
+
+        def FetchCounters(self, counters):
+            self.fetch_counter_calls += 1
+            assert counters == [event_counter]
+            return []
+
+    controller = TimingController()
+    client = BridgeClient(FakeContext(controller))
+    monkeypatch.setattr(
+        bridge_client_module,
+        "rd",
+        SimpleNamespace(GPUCounter=SimpleNamespace(EventGPUDuration=event_counter)),
+    )
+    monkeypatch.setattr(
+        client,
+        "_get_capture_summary",
+        lambda: {"capture": {}, "api": "D3D12", "frame": {}, "statistics": {}, "resource_counts": {}},
+    )
+    monkeypatch.setattr(client, "_ensure_frame_analysis", lambda: {"root_pass_ids": [], "root_action_ids": []})
+
+    overview = client._get_capture_overview()
+
+    assert overview["capabilities"]["timing_data"] is True
+    assert overview["capabilities"]["timing_data_collected"] is False
+    assert controller.fetch_counter_calls == 0
+    assert controller.block_invoke_count == 1
+
+    timing = client._ensure_timing_data()
+
+    assert timing["timing_available"] is True
+    assert controller.fetch_counter_calls == 1
+    assert controller.block_invoke_count == 2
 
 
 def test_bridge_client_flattens_semantic_shader_bindings_with_stage_context() -> None:
@@ -431,12 +572,137 @@ def test_resource_binding_search_reports_actual_and_bounded_return_counts(monkey
     assert result["meta"]["scan"]["matches_truncated"] is True
 
 
+def test_resource_binding_search_batches_replay_and_caches_event_results(monkeypatch) -> None:
+    access = SimpleNamespace(
+        stage="Pixel",
+        type="ReadOnlyResource",
+        index=3,
+        arrayElement=0,
+        descriptorStore=None,
+        byteOffset=0,
+        byteSize=0,
+        staticallyUnused=False,
+    )
+    descriptor = SimpleNamespace(
+        type="Image",
+        resource="tex-1",
+        secondary=None,
+        view=None,
+        byteOffset=0,
+        byteSize=0,
+        elementByteSize=0,
+        firstMip=0,
+        numMips=1,
+        firstSlice=0,
+        numSlices=1,
+        format=None,
+    )
+    used = SimpleNamespace(access=access, descriptor=descriptor)
+
+    class BindingState(FakeState):
+        def GetShader(self, stage):
+            return "shader-1"
+
+        def GetReadOnlyResources(self, stage, only_used=True):
+            return [used]
+
+        def GetReadWriteResources(self, stage, only_used=True):
+            return []
+
+        def GetConstantBlocks(self, stage, only_used=True):
+            return []
+
+    class BatchController(FakeController):
+        def __init__(self) -> None:
+            super().__init__(state=BindingState())
+            self.set_frame_event_calls: list[tuple[int, bool]] = []
+
+        def SetFrameEvent(self, event_id, force):
+            self.set_frame_event_calls.append((int(event_id), bool(force)))
+
+    controller = BatchController()
+    client = BridgeClient(FakeContext(controller))
+    analysis = {"action_index": {event_id: {"flags": ["draw"]} for event_id in range(7, 12)}}
+    monkeypatch.setattr(bridge_client_module, "_shader_stage_values", lambda: ["Pixel"])
+    monkeypatch.setattr(client, "_resource_usage_target", lambda resource_id: ("texture", {"resourceId": resource_id}))
+    monkeypatch.setattr(client, "_ensure_frame_analysis", lambda: analysis)
+    monkeypatch.setattr(client, "_compact_texture", lambda resource: {"resource_id": "tex-1"})
+    monkeypatch.setattr(
+        bridge_client_module.frame_analysis,
+        "build_action_summary_result",
+        lambda frame, event_id: {"action": {"event_id": event_id}},
+    )
+
+    first = client._search_resource_bindings("tex-1", None, None, None, 100, 100)
+    first_block_invoke_count = controller.block_invoke_count
+    second = client._search_resource_bindings("tex-1", None, None, None, 100, 100)
+
+    assert first["matched_event_count"] == 5
+    assert first["meta"]["scan"]["performance"]["mode"] == "batched_replay"
+    assert controller.set_frame_event_calls == [(event_id, False) for event_id in range(7, 12)]
+    assert first_block_invoke_count == 1
+    assert controller.block_invoke_count == first_block_invoke_count
+    assert second["meta"]["scan"]["performance"] == {
+        "mode": "cache",
+        "cache_hit_count": 5,
+        "replayed_event_count": 0,
+    }
+
+
 def test_bridge_client_texture_recommendations_include_probe_tool() -> None:
     client = BridgeClient(FakeContext(FakeController()))
 
     recommendations = client._resource_recommendations({"kind": "texture", "resource_id": "tex-1"})
 
     assert any(item["tool"] == "renderdoc_probe_texture_regions" for item in recommendations)
+
+
+def test_texture_grid_cache_avoids_repeated_pick_pixel_calls(monkeypatch) -> None:
+    class Subresource:
+        mip = 0
+        slice = 0
+        sample = 0
+
+    class TextureController(FakeController):
+        def __init__(self) -> None:
+            super().__init__()
+            self.pick_pixel_calls = 0
+
+        def PickPixel(self, resource_id, x, y, subresource, comp_type):
+            self.pick_pixel_calls += 1
+            return SimpleNamespace(x=float(x), y=float(y), z=0.0, w=1.0)
+
+    texture = SimpleNamespace(
+        resourceId="tex-1",
+        format=SimpleNamespace(compType="Float", compCount=4, compByteWidth=4, type="Regular"),
+        dimension="Texture2D",
+        type="Texture2D",
+        width=8,
+        height=8,
+        depth=1,
+        mips=1,
+        arraysize=1,
+        msSamp=1,
+        byteSize=1024,
+        creationFlags="ShaderRead",
+    )
+    controller = TextureController()
+    client = BridgeClient(FakeContext(controller))
+    monkeypatch.setattr(bridge_client_module, "rd", SimpleNamespace(Subresource=Subresource))
+    monkeypatch.setattr(client, "_ensure_final_event", lambda: {})
+    monkeypatch.setattr(client, "_find_texture_by_id", lambda texture_id: texture)
+    monkeypatch.setattr(
+        client,
+        "_validate_texture_request",
+        lambda *args, **kwargs: {"mip_width": 8, "mip_height": 8, "mip_depth": 1},
+    )
+
+    first = client._get_texture_data("tex-1", 0, 1, 2, 2, 2, 0, 0)
+    second = client._get_texture_data("tex-1", 0, 1, 2, 2, 2, 0, 0)
+
+    assert first["meta"]["pixel_grid_cache_hit"] is False
+    assert second["meta"]["pixel_grid_cache_hit"] is True
+    assert controller.pick_pixel_calls == 4
 
 
 def test_bridge_client_probe_texture_regions_detects_single_active_block(monkeypatch) -> None:
@@ -1032,6 +1298,12 @@ def test_bridge_client_pixel_shader_debug_sessions_buffer_continue_states(monkey
     assert started["meta"]["has_more"] is True
     assert controller.debug_pixel_calls[0][0:2] == (4, 5)
     assert controller.debug_pixel_calls[0][2].sample == 0xFFFFFFFF
+    assert set(client.shader_debug_sessions[started["shader_debug_id"]]["instruction_info_by_index"]) == {0, 1, 2}
+    monkeypatch.setattr(
+        client,
+        "_build_instruction_info_index",
+        lambda trace: pytest.fail("instruction metadata should be indexed once per debug session"),
+    )
 
     continued = client._continue_shader_debug(started["shader_debug_id"], 1)
     assert continued["returned_state_count"] == 1
@@ -1211,6 +1483,19 @@ def test_bridge_client_clear_analysis_cache_releases_shader_debug_sessions() -> 
     controller = FakeController(shader_debugging=True)
     trace = object()
     client = BridgeClient(FakeContext(controller))
+    client.analysis_cache.store("analysis", {"frame": 1})
+    client.timing_capability_cache.store("timing-capability", {"supported": True})
+    client.shader_debug_capability_cache.store("shader-capability", {"supported": True})
+    client.timing_cache.store("timing", {"event": 7})
+    client.resource_catalog_cache.store("resources", ["tex-1"])
+    client.shader_code_cache["shader-1"] = {"source": "main"}
+    client.pipeline_cache[7] = {"pipeline": {}}
+    client.resource_binding_cache[(7, "tex-1")] = {"bindings": []}
+    client.texture_grid_cache[("tex-1", 0, 0, 0, 0, 2, 2)] = {
+        "response": {"pixels": []},
+        "pixel_count": 4,
+    }
+    client.texture_grid_cache_pixels = 4
     client.shader_debug_sessions["debug-1"] = {
         "shader_debug_id": "debug-1",
         "trace": trace,
@@ -1222,5 +1507,15 @@ def test_bridge_client_clear_analysis_cache_releases_shader_debug_sessions() -> 
 
     client._clear_analysis_cache()
 
+    assert client.analysis_cache.get("analysis") is None
+    assert client.timing_capability_cache.get("timing-capability") is None
+    assert client.shader_debug_capability_cache.get("shader-capability") is None
+    assert client.timing_cache.get("timing") is None
+    assert client.resource_catalog_cache.get("resources") is None
+    assert client.shader_code_cache == {}
+    assert client.pipeline_cache == {}
+    assert client.resource_binding_cache == {}
+    assert client.texture_grid_cache == {}
+    assert client.texture_grid_cache_pixels == 0
     assert client.shader_debug_sessions == {}
     assert controller.freed_traces == [trace]

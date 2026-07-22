@@ -91,7 +91,7 @@ renderdoc_open_capture(capture_path="C:\\captures\\frame.rdc")
 
 The response includes `capture_id`, `capture_path`, and a compact capture overview. Opening the same normalized path again reuses the same bridge and `capture_id`; inspect retained sessions with `renderdoc_list_open_captures`.
 
-`renderdoc_get_capture_overview` also reports capability flags such as `shader_debugging`, which indicates whether the active replay device can create RenderDoc shader debug traces for this capture.
+`renderdoc_get_capture_overview` also reports capability flags such as `shader_debugging`, which indicates whether the active replay device can create RenderDoc shader debug traces for this capture. GPU timing support is checked without collecting the full counter set: `timing_data_collected=false` remains until a timing or performance tool first needs those rows, after which the result is cached for the capture.
 
 Use that `capture_id` for all follow-up tools:
 
@@ -271,6 +271,8 @@ renderdoc_search_resource_bindings(
 )
 ```
 
+The binding scan batches compatible replay-controller event transitions and caches per-resource/event matches. `meta.scan.performance` reports whether a page used batched replay, the compatibility fallback, or only cached rows.
+
 To locate sparse or unexpectedly active areas before choosing a pixel to debug:
 
 ```powershell
@@ -288,6 +290,7 @@ renderdoc_probe_texture_regions(
 
 Besides threshold modes (`luma`, `max_rgb`, `alpha`, and `any`), `channel_mode` supports `nan_inf`, `local_outlier`, and `gradient` for common correctness searches without exporting a full texture.
 If `width` and `height` are omitted, the probe defaults to 64×64; explicit windows are limited to 128×128 and 16,384 pixels.
+Exact sampled grids are retained in a bounded per-capture pixel cache, so repeated probes or a follow-up `renderdoc_get_texture_data` call for the same subresource and rectangle avoid another `PickPixel` sweep.
 
 Pixel debugging tools are still available:
 
@@ -404,6 +407,8 @@ renderdoc_compare_texture_regions(
   x=496, y=368, width=32, height=32
 )
 ```
+
+Baseline and candidate reads run concurrently when they belong to different open capture sessions; comparisons within one capture remain serialized through that capture's bridge.
 
 If a later turn no longer has the investigation id, recover active ids and focus with `renderdoc_list_investigations()`.
 
@@ -588,7 +593,7 @@ renderdoc_get_server_status()
 renderdoc_open_capture(capture_path="C:\\captures\\frame.rdc")
 ```
 
-同一路径会复用已有 bridge 和 `capture_id`。相关的多轮分析中持续复用该 id，可通过 `renderdoc_list_open_captures` 恢复当前会话；不要在每轮结束时关闭 capture。
+同一路径会复用已有 bridge 和 `capture_id`。相关的多轮分析中持续复用该 id，可通过 `renderdoc_list_open_captures` 恢复当前会话；不要在每轮结束时关闭 capture。打开 capture 时只检查 GPU timing 能力，不立即采集整帧 counter；`timing_data_collected=false` 会持续到 timing/performance 工具首次真正需要数据，之后结果会按 capture 缓存。
 
 先拿整体概览和工作清单：
 
@@ -714,6 +719,8 @@ renderdoc_search_resource_bindings(
 )
 ```
 
+兼容的 RenderDoc 版本会在一个 replay 批次内切换并扫描多个事件，同时缓存 resource/event 匹配；`meta.scan.performance` 会标明使用了批量 replay、兼容回退还是纯缓存结果。
+
 在选择要调试的像素前，可以先扫描稀疏或异常活跃区域：
 
 ```powershell
@@ -731,6 +738,7 @@ renderdoc_probe_texture_regions(
 
 除阈值模式外，`channel_mode` 还支持 `nan_inf`、`local_outlier` 和 `gradient`，可直接筛查非有限值、局部离群与边缘突变。
 省略 `width`、`height` 时默认扫描 64×64；显式窗口最多 128×128，且总像素数不能超过 16,384。
+采样网格保存在有界的 capture 内像素缓存中；同一 subresource 和矩形上的重复 probe，或紧接着调用 `renderdoc_get_texture_data`，不会再次执行整块 `PickPixel` 扫描。
 
 跨轮次或跨 capture 回归分析时，用 investigation 保存当前 focus 和证据；事件与小纹理区域可直接做语义 diff：
 
@@ -746,6 +754,8 @@ renderdoc_compare_events(
   candidate_capture_id="<candidate_id>", candidate_event_id=1250
 )
 ```
+
+baseline 与 candidate 属于不同 capture session 时会并行读取；同一 capture 内仍通过该 capture 的 bridge 串行执行。
 
 后续轮次若丢失了 investigation id，可调用 `renderdoc_list_investigations()` 恢复当前 id 和 focus。
 

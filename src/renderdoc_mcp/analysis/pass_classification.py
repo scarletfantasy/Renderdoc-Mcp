@@ -51,6 +51,10 @@ def build_frame_analysis(nodes, metadata):
     index_action_nodes(annotated_nodes, action_index)
     action_children_index = {"": [int(node["event_id"]) for node in annotated_nodes]}
     _index_action_children(annotated_nodes, action_children_index)
+    action_preorder_ids = []  # type: list[int]
+    action_descendant_ranges = {"": (0, 0)}
+    _index_action_preorder(annotated_nodes, action_preorder_ids, action_descendant_ranges)
+    action_descendant_ranges[""] = (0, len(action_preorder_ids))
 
     top_level_passes = []
     pass_index = {}  # type: dict
@@ -99,6 +103,11 @@ def build_frame_analysis(nodes, metadata):
         "root_pass_ids": root_pass_ids,
         "action_index": action_index,
         "action_children_index": action_children_index,
+        "action_preorder_ids": action_preorder_ids,
+        "action_descendant_ranges": action_descendant_ranges,
+        "action_search_cache": {},
+        "action_search_cache_order": [],
+        "event_pass_index": {},
         "root_action_ids": action_children_index[""],
         "max_event_id": max(action_index) if action_index else 0,
         "resource_usage_index": build_resource_usage_index(annotated_nodes),
@@ -124,6 +133,9 @@ def get_pass_summary(analysis_cache, pass_id):
 
 def get_innermost_pass_for_event(analysis_cache, event_id):
     normalized_event_id = int(event_id)
+    event_pass_index = analysis_cache.setdefault("event_pass_index", {})
+    if normalized_event_id in event_pass_index:
+        return event_pass_index[normalized_event_id]
     matches = []
 
     for pass_payload in analysis_cache.get("all_passes", []):
@@ -134,6 +146,7 @@ def get_innermost_pass_for_event(analysis_cache, event_id):
             matches.append(pass_payload)
 
     if not matches:
+        event_pass_index[normalized_event_id] = None
         return None
 
     matches.sort(
@@ -144,6 +157,7 @@ def get_innermost_pass_for_event(analysis_cache, event_id):
             str(item["pass_id"]),
         )
     )
+    event_pass_index[normalized_event_id] = matches[0]
     return matches[0]
 
 
@@ -515,6 +529,15 @@ def _index_action_children(nodes, output):
     for node in nodes:
         output[str(int(node["event_id"]))] = [int(child["event_id"]) for child in node.get("children", [])]
         _index_action_children(node.get("children", []), output)
+
+
+def _index_action_preorder(nodes, preorder_ids, descendant_ranges):
+    for node in nodes:
+        event_id = int(node["event_id"])
+        preorder_ids.append(event_id)
+        descendant_start = len(preorder_ids)
+        _index_action_preorder(node.get("children", []), preorder_ids, descendant_ranges)
+        descendant_ranges[str(event_id)] = (descendant_start, len(preorder_ids))
 
 
 def _representative_event(node):

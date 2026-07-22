@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,8 @@ class DummyBridge:
         self.renderdoc_version = "1.43"
         self.action_name = "Draw"
         self.texture_value = 0.0
+        self.call_barrier: threading.Barrier | None = None
+        self.barrier_methods: set[str] = set()
 
     def ensure_capture_loaded(self, capture_path: str):
         self.loaded.append(capture_path)
@@ -28,6 +31,8 @@ class DummyBridge:
     def call(self, method: str, params=None):
         payload = params or {}
         self.calls.append((method, payload))
+        if self.call_barrier is not None and method in self.barrier_methods:
+            self.call_barrier.wait(timeout=2.0)
 
         if method == "get_capture_overview":
             return {
@@ -1078,6 +1083,27 @@ def test_cross_capture_event_and_texture_diffs_are_compact(tmp_path: Path) -> No
     assert texture_diff["summary"]["changed_pixel_count"] == 4
     assert texture_diff["summary"]["max_finite_abs_difference"] == 0.25
     assert len(texture_diff["top_changed_pixels"]) == 4
+
+
+def test_cross_capture_comparison_reads_independent_bridges_in_parallel(tmp_path: Path) -> None:
+    application, created = _application()
+    baseline = application.captures.renderdoc_open_capture(_capture(tmp_path, "baseline.rdc"))
+    candidate = application.captures.renderdoc_open_capture(_capture(tmp_path, "candidate.rdc"))
+    barrier = threading.Barrier(2)
+    for bridge in created:
+        bridge.call_barrier = barrier
+        bridge.barrier_methods = {"get_event_dossier"}
+
+    result = application.investigation.renderdoc_compare_events(
+        baseline["capture_id"],
+        42,
+        candidate["capture_id"],
+        84,
+    )
+
+    assert result["baseline"]["event_id"] == 42
+    assert result["candidate"]["event_id"] == 84
+    assert barrier.n_waiting == 0
 
 
 def test_event_diff_only_marks_truncated_when_an_additional_change_exists() -> None:

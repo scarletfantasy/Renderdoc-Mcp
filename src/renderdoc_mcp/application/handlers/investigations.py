@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from renderdoc_mcp.application.compare import compare_event_dossiers
@@ -258,12 +259,10 @@ class InvestigationHandlers:
                 {"baseline_event_id": baseline_event, "candidate_event_id": candidate_event},
             )
         params_base = {"binding_kinds": list(kinds), "binding_limit": 50}
-        baseline_session, baseline = self.context.capture_tool(
+        (baseline_session, baseline), (candidate_session, candidate) = self._capture_tool_pair(
             baseline_capture_id,
             "get_event_dossier",
             {**params_base, "event_id": baseline_event},
-        )
-        candidate_session, candidate = self.context.capture_tool(
             candidate_capture_id,
             "get_event_dossier",
             {**params_base, "event_id": candidate_event},
@@ -342,12 +341,10 @@ class InvestigationHandlers:
             "array_slice": self.context.normalize_non_negative_int(array_slice, "array_slice"),
             "sample": self.context.normalize_non_negative_int(sample, "sample"),
         }
-        baseline_session, baseline = self.context.capture_tool(
+        (baseline_session, baseline), (candidate_session, candidate) = self._capture_tool_pair(
             baseline_capture_id,
             "get_texture_data",
             {**common, "texture_id": self.context.normalize_required_string(baseline_texture_id, "baseline_texture_id")},
-        )
-        candidate_session, candidate = self.context.capture_tool(
             candidate_capture_id,
             "get_texture_data",
             {**common, "texture_id": self.context.normalize_required_string(candidate_texture_id, "candidate_texture_id")},
@@ -367,6 +364,49 @@ class InvestigationHandlers:
             self.context.normalize_non_negative_float(threshold, "threshold"),
             normalized_top_pixel_limit,
         )
+
+    def _capture_tool_pair(
+        self,
+        baseline_capture_id: str,
+        baseline_method: str,
+        baseline_params: dict[str, Any],
+        candidate_capture_id: str,
+        candidate_method: str,
+        candidate_params: dict[str, Any],
+    ) -> tuple[
+        tuple[Any, dict[str, Any]],
+        tuple[Any, dict[str, Any]],
+    ]:
+        normalized_baseline_id = self.context.normalizer.normalize_required_capture_id(baseline_capture_id)
+        normalized_candidate_id = self.context.normalizer.normalize_required_capture_id(candidate_capture_id)
+        if normalized_baseline_id == normalized_candidate_id:
+            return (
+                self.context.sessions.capture_tool_normalized(
+                    normalized_baseline_id,
+                    baseline_method,
+                    baseline_params,
+                ),
+                self.context.sessions.capture_tool_normalized(
+                    normalized_candidate_id,
+                    candidate_method,
+                    candidate_params,
+                ),
+            )
+
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="renderdoc_compare") as executor:
+            baseline_future = executor.submit(
+                self.context.sessions.capture_tool_normalized,
+                normalized_baseline_id,
+                baseline_method,
+                baseline_params,
+            )
+            candidate_future = executor.submit(
+                self.context.sessions.capture_tool_normalized,
+                normalized_candidate_id,
+                candidate_method,
+                candidate_params,
+            )
+            return baseline_future.result(), candidate_future.result()
 
     def _decorate_summary(self, investigation: dict[str, Any]) -> dict[str, Any]:
         open_ids = {str(item["capture_id"]) for item in self.context.sessions.list_sessions()}

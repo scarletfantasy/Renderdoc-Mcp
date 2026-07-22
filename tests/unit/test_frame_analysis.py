@@ -115,6 +115,43 @@ def test_build_frame_analysis_indexes_nested_passes_and_actions() -> None:
     assert analysis["pass_children_index"]["pass:10-21"] == ["pass:20-21"]
     assert analysis["action_children_index"][""] == [10, 30]
     assert analysis["action_children_index"]["10"] == [20]
+    assert analysis["action_preorder_ids"] == [10, 20, 21, 30]
+    assert analysis["action_descendant_ranges"]["10"] == (1, 3)
+
+    first_pass = frame_analysis.get_innermost_pass_for_event(analysis, 21)
+    second_pass = frame_analysis.get_innermost_pass_for_event(analysis, 21)
+
+    assert first_pass is second_pass
+    assert analysis["event_pass_index"][21] is first_pass
+
+
+def test_recursive_action_search_reuses_filtered_event_ids_across_pages() -> None:
+    nodes = [
+        _action(
+            10,
+            "Scene",
+            ["push_marker"],
+            children=[
+                _action(20, "Draw A", ["draw"]),
+                _action(30, "Draw B", ["draw"]),
+                _action(40, "Dispatch", ["dispatch"]),
+            ],
+        )
+    ]
+    analysis = frame_analysis.build_frame_analysis(nodes, _metadata(nodes))
+
+    first = frame_analysis.build_action_search_result(analysis, parent_event_id=10, flags_filter="draw", limit=1)
+    second = frame_analysis.build_action_search_result(
+        analysis,
+        parent_event_id=10,
+        flags_filter="draw",
+        cursor=first["meta"]["page"]["next_cursor"],
+        limit=1,
+    )
+
+    assert first["meta"]["search_cache_hit"] is False
+    assert second["meta"]["search_cache_hit"] is True
+    assert [item["event_id"] for item in first["actions"] + second["actions"]] == [20, 30]
 
 
 def test_list_passes_can_drill_into_parent_pass_id() -> None:

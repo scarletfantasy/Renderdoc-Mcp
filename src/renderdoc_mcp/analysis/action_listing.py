@@ -149,8 +149,16 @@ def build_action_search_result(
     if parent_key and int(parent_key) not in action_index:
         return None
 
+    preorder_ids = analysis_cache.get("action_preorder_ids")
+    descendant_ranges = analysis_cache.get("action_descendant_ranges", {})
+    descendant_range = descendant_ranges.get(parent_key)
     candidate_ids = []  # type: list[int]
-    _collect_descendant_action_ids(children_index, parent_key, candidate_ids)
+    candidate_count = 0
+    if preorder_ids is not None and descendant_range is not None:
+        candidate_count = max(0, int(descendant_range[1]) - int(descendant_range[0]))
+    else:
+        _collect_descendant_action_ids(children_index, parent_key, candidate_ids)
+        candidate_count = len(candidate_ids)
     query_lower = _lower(query)
     required_flags = {item for item in (_lower(flags_filter) or "").replace(",", " ").split() if item}
     normalized_resource_id = str(resource_id or "").strip()
@@ -160,31 +168,57 @@ def build_action_search_result(
         for row in resource_rows
     }
 
-    matches = []
-    for event_id in candidate_ids:
+    cache_key = (
+        parent_key,
+        query_lower or "",
+        tuple(sorted(required_flags)),
+        normalized_resource_id,
+        int(event_id_min) if event_id_min is not None else None,
+        int(event_id_max) if event_id_max is not None else None,
+    )
+    search_cache = analysis_cache.setdefault("action_search_cache", {})
+    cache_order = analysis_cache.setdefault("action_search_cache_order", [])
+    matching_ids = search_cache.get(cache_key)
+    cache_hit = matching_ids is not None
+    if matching_ids is None:
+        if preorder_ids is not None and descendant_range is not None:
+            candidate_ids = list(preorder_ids[descendant_range[0] : descendant_range[1]])
+        matching_ids = []
+        for event_id in candidate_ids:
+            node = action_index.get(int(event_id))
+            if node is None:
+                continue
+            if query_lower and query_lower not in str(node.get("name", "")).lower():
+                continue
+            if required_flags and not required_flags.issubset(set(node.get("flags", []))):
+                continue
+            if event_id_min is not None and int(event_id) < int(event_id_min):
+                continue
+            if event_id_max is not None and int(event_id) > int(event_id_max):
+                continue
+            if normalized_resource_id and int(event_id) not in resource_usage_by_event:
+                continue
+            matching_ids.append(int(event_id))
+        search_cache[cache_key] = matching_ids
+        cache_order.append(cache_key)
+        while len(cache_order) > 16:
+            expired_key = cache_order.pop(0)
+            search_cache.pop(expired_key, None)
+
+    page_limit = int(limit if limit is not None else DEFAULT_ACTION_PAGE_LIMIT)
+    offset = int(cursor or 0)
+    page_ids = matching_ids[offset : offset + page_limit]
+    page = []
+    for event_id in page_ids:
         node = action_index.get(int(event_id))
         if node is None:
             continue
         entry = compact_action_entry(node)
-        if query_lower and query_lower not in entry["name"].lower():
-            continue
-        if required_flags and not required_flags.issubset(set(entry["flags"])):
-            continue
-        if event_id_min is not None and int(event_id) < int(event_id_min):
-            continue
-        if event_id_max is not None and int(event_id) > int(event_id_max):
-            continue
-        if normalized_resource_id and int(event_id) not in resource_usage_by_event:
-            continue
         if normalized_resource_id:
             entry["matched_resource_usage_kinds"] = resource_usage_by_event[int(event_id)]
-        matches.append(entry)
-
-    page_limit = int(limit if limit is not None else DEFAULT_ACTION_PAGE_LIMIT)
-    offset = int(cursor or 0)
-    page = matches[offset : offset + page_limit]
+        page.append(entry)
     next_offset = offset + len(page)
-    has_more = next_offset < len(matches)
+    has_more = next_offset < len(matching_ids)
 
     return with_meta(
         {
@@ -201,13 +235,14 @@ def build_action_search_result(
             next_cursor=str(next_offset) if has_more else "",
             limit=page_limit,
             returned_count=len(page),
-            total_count=len(candidate_ids),
-            matched_count=len(matches),
+            total_count=candidate_count,
+            matched_count=len(matching_ids),
             has_more=has_more,
         ),
         extra_meta={
             "search_scope": "recursive_descendants",
             "resource_filter_coverage": "rt_texture_v1" if normalized_resource_id else "",
+            "search_cache_hit": cache_hit,
         },
     )
 
